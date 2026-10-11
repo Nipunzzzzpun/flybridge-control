@@ -8,7 +8,7 @@ The fly body is the official NeuroMechFly model (FlyGym 2.x meshes). Its legs wa
 and the brain's descending-neuron drives steer it (forward / back / left / right).
 The brain view uses coordinates from brain_subset.npz (built from MaleCNS v1.0).
 
-Run:  python FlyLab_updated.py
+Run:  python flylab.py
 
 One-time install. FlyGym 2.x needs Python 3.12 or newer (check with:  python --version) and git.
 Use the SAME python for every line and to run this file (on Windows, e.g. replace "python" with "py -3.12"):
@@ -20,7 +20,7 @@ In the app:  Control Panel = live brain + NeuroMechFly body (drag the fly to rot
 (Dynamic environment = the fly wanders by itself, or any BadApple-fly movement program), Build tab = place obstacles and food.
 Template alignment (optional, navis transforms tutorial):  python -m pip install navis flybrains h5py
 """
-import ctypes, os, sys, json, time, threading, base64, math, re, queue, warnings, textwrap
+import random, ctypes, os, sys, json, time, threading, base64, math, re, queue, warnings, textwrap
 # Make Windows report real pixels to everything (Tk, screen capture, clicks) so coordinates all agree.
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -211,6 +211,7 @@ class LIFSim:
             self.ref = np.zeros(n, np.float32)
             self.flash = np.zeros(n, np.float32)
             self._last = np.zeros(0, np.int64)
+            self._pop = 0.0
             self.t_ms = 0.0
             for k in self.rates:
                 self.rates[k] = 0.0
@@ -236,7 +237,7 @@ class LIFSim:
         if self._last.size:
             inp = self._gather(self._last)
             if inp is not None:
-                self.g += (inp * (W_SYN * self.gain)).astype(np.float32)
+                self.g += (inp * (W_SYN * self.gain / (1.0 + (self._pop / POP_REF) ** 2))).astype(np.float32)
         si = self.stim_idx
         if si.size:
             hit = si[self._rng.random(si.size) < self.stim_rate * DT / 1000.0]
@@ -256,6 +257,7 @@ class LIFSim:
             self.v[spk] = V_RESET
             self.ref[spk] = T_REF
         self._last = spk
+        self._pop += 0.02 * (spk.size / self.net.n - self._pop)     # global activity level (about 50 ms memory)
         self.flash *= _DECAY_FLASH
         self.flash[spk] = 1.0
         self.t_ms += DT
@@ -302,8 +304,10 @@ FOOD_RANGE = 22.0          # mm, how far the fly "smells" food
 AVOID_RANGE = 6.0          # mm, how far ahead it "sees" obstacles and walls
 EAT_RANGE = 1.6            # mm
 EAT_SECONDS = 4.0          # how long one food pellet takes to eat
-ENV_RATE_HZ = 200.0        # Poisson rate on a descending-neuron group at full command
+ENV_RATE_HZ = 600.0        # Poisson rate on a descending-neuron group at full command
 UP_POOL = 120              # strongest upstream (premotor) neurons per DN group that carry the command into the network
+POP_REF = 0.0025           # population rate (spikes per neuron per ms, = 2.5 Hz) above which global inhibition damps the synapses
+UP_GAIN_POW = 1.0          # the stronger the synapse gain slider, the weaker this extra drive (keeps the network from running away)
 UP_RATE_HZ = 24.0          # Poisson rate on those at full command, so activity visibly flows through the brain on the way to the DNs
 def wrap_pi(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
@@ -1233,7 +1237,7 @@ class NeuroMechFlyBody:
             msg = (self.error or "FlyGym not installed").replace("RuntimeError: ", "")
             for i, line in enumerate(textwrap.wrap(msg, 50)[:9]):
                 cv2.putText(img, line, (12, 70 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(img, "Install lines: top of FlyLab_updated.py", (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.putText(img, "Install lines: top of flylab.py", (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 60), 1, cv2.LINE_AA)
             return img
         now = time.perf_counter()
         if self._cached is not None and now - self._t_last < max(0.033, 2.5 * self._render_s):
@@ -1405,6 +1409,24 @@ class FlyControllerApp:
         self.preset_combo = None
         self.load_brain()
     @staticmethod
+    def cut_pool_to_dn(net, pools):
+        """The premotor pool lights up the brain view, but the DN drives (which steer the body) must come only from the
+        explicit commands - so the pool's own links onto the DNs are removed (in memory only, nothing is saved)."""
+        try:
+            W = net.W.tocsc()
+            dn = np.zeros(net.n, bool)
+            for g in GROUPS:
+                dn[net.groups[g]] = True
+            for g in GROUPS:
+                for c in pools[g]:
+                    a, b = W.indptr[c], W.indptr[c + 1]
+                    rows = W.indices[a:b]
+                    W.data[a:b][dn[rows]] = 0.0
+            W.eliminate_zeros()
+            net.W = W
+        except Exception as err:
+            print("[!] could not cut pool->DN links:", err)
+    @staticmethod
     def build_up_pools(net):
         """For each DN group: the neurons that feed it most strongly (excluding the DNs themselves)."""
         pools = {}
@@ -1445,6 +1467,7 @@ class FlyControllerApp:
             self.sim.stop()
         self.net = net
         self.up_pool = self.build_up_pools(net)
+        self.cut_pool_to_dn(net, self.up_pool)
         self.stim_mask = np.zeros(net.n, bool)
         self._proj = (np.zeros(net.n),) * 3
         self.region_cols = REGION_COLORS[net.labels]
@@ -1690,9 +1713,21 @@ class FlyControllerApp:
             if dynamic:                                    # wander + react to food / obstacles
                 sense = self.arena.sense(self.body.x, self.body.y, self.body.heading)
                 lvl, bk, lt, rt = env_commands(sense, self.explorer.update(dt))
+                # stuck-escape: if the fly has hardly moved for a few seconds (pinned at a wall / obstacle), turn away and walk off
+                self._stuck_clock = getattr(self, "_stuck_clock", 0.0) + dt
+                if self._stuck_clock >= 2.0:
+                    p0 = getattr(self, "_stuck_pos", (self.body.x, self.body.y))
+                    if math.hypot(self.body.x - p0[0], self.body.y - p0[1]) < 1.5 and not feeding:
+                        self._escape_t = 1.6
+                        self._escape_turn = random.choice((-1.0, 1.0))
+                    self._stuck_pos = (self.body.x, self.body.y)
+                    self._stuck_clock = 0.0
+                if getattr(self, "_escape_t", 0.0) > 0.0:
+                    self._escape_t -= dt
+                    lvl, bk, lt, rt = 0.85, 0.0, max(0.0, self._escape_turn), max(0.0, -self._escape_turn)
                 for key, val in (("fwd", lvl), ("back", bk), ("left", lt), ("right", rt)):
                     ext[self.net.groups[key]] = ENV_RATE_HZ * val
-                    ext[self.up_pool[key]] = np.maximum(ext[self.up_pool[key]], UP_RATE_HZ * val)
+                    ext[self.up_pool[key]] = np.maximum(ext[self.up_pool[key]], UP_RATE_HZ * val / max(0.5, self.sim.gain) ** UP_GAIN_POW)
             elif mode != BASE_LABEL:                       # a BadApple-fly movement program: stimulate its neurons
                 sides = {"Both": ("L", "R"), "Left": ("L",), "Right": ("R",)}[self.side_var.get()]
                 for sd in sides:
