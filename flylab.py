@@ -1311,8 +1311,11 @@ class FlyControllerApp:
         # Live brain + body
         self.init_brain()
         # UI: one window. Tab 1 = Brain Lab (left) + Fly Bridge controls (right). Tab 2 = MaleCNS setup.
+        bottom_bar = ttk.Frame(root, padding=(15, 6, 15, 10))        # always visible, whichever tab is open
+        bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(bottom_bar, text="Terminate Process", command=self.terminate).pack(fill=tk.X)
         self.nb = ttk.Notebook(root)
-        self.nb.pack(fill=tk.BOTH, expand=True)
+        self.nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         tab_ctrl = ttk.Frame(self.nb)
         tab_build = ttk.Frame(self.nb)
         tab_setup = ttk.Frame(self.nb)
@@ -1373,7 +1376,6 @@ class FlyControllerApp:
         ttk.Checkbutton(master_settings_frame, text="Enable Jump Inputs (Space)", variable=self.jump_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Enable Block Placement Macro (WSW Combo)", variable=self.macro_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Auto-Replay Mode", variable=self.replay_enabled).pack(anchor=tk.W, pady=2)
-        ttk.Button(main_frame, text="Terminate Process", command=self.terminate).pack(fill=tk.X, pady=(10, 0))
         self.update_mode_states()
         self.vision_thread = threading.Thread(target=self.run_vision, daemon=True)
         self.vision_thread.start()
@@ -1393,11 +1395,12 @@ class FlyControllerApp:
         self.brush_var = tk.DoubleVar(value=22.0)
         self.net_note = tk.StringVar(value="")
         self.show_skel = tk.BooleanVar(value=True)
-        self.blur_var = tk.DoubleVar(value=0.8)
+        self.blur_var = tk.DoubleVar(value=0.0)
         self.yaw, self.pitch, self.zoom = 0.0, 0.0, 1.7
         self.mouse = None
         self._imgs = {}
         self.sim = None
+        self.arena_px = ARENA_PX
         self.arena = Arena()
         self.arena.default_layout()
         self.body.arena = self.arena
@@ -1537,7 +1540,7 @@ class FlyControllerApp:
         self.make_slider(sliders, "Synapse gain", self.gain_var, 0.5, 8.0, "{:.2f}")
         self.make_slider(sliders, "Stim rate (Hz)", self.rate_var, 10, 300, "{:.0f}")
         self.make_slider(sliders, "Brush (px)", self.brush_var, 6, 70, "{:.0f}")
-        self.make_slider(sliders, "Blur (low = crisp)", self.blur_var, 0.4, 2.0, "{:.1f}")
+        self.make_slider(sliders, "Blur (0 = crisp)", self.blur_var, 0.0, 2.0, "{:.1f}")
         self.status = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.status, font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
         ttk.Label(parent, textvariable=self.net_note, foreground="#666666").pack(anchor=tk.W)
@@ -1560,7 +1563,8 @@ class FlyControllerApp:
         self.stim_mask[:] = False
         self.sim.set_stim(self.stim_mask)
     def reset_view(self):
-        self.yaw, self.pitch, self.zoom = 0.0, 0.0, 1.7
+        self.yaw, self.pitch, self.zoom = 0.0, 0.0, 1.7      # brain view
+        self.body.view_reset()                              # fly view
     def body_drag(self, e):
         lx, ly = getattr(self, "_body_drag", (e.x, e.y))
         self.body.view_orbit(e.x - lx, e.y - ly)
@@ -1631,7 +1635,7 @@ class FlyControllerApp:
                 return np.zeros((H, W), np.float32)
             m = np.bincount(flat[idx], weights=weights[idx] if weights is not None else None,
                             minlength=H * W).astype(np.float32).reshape(H, W)
-            return cv2.GaussianBlur(m, (0, 0), sigma)
+            return m if sigma < 0.05 else cv2.GaussianBlur(m, (0, 0), sigma)
 
         allidx = np.arange(len(P))
         dens = splat(allidx)
@@ -1678,8 +1682,6 @@ class FlyControllerApp:
                 cv2.circle(img, (int(px), int(py)), 2, GROUP_COLORS[g], -1, cv2.LINE_AA)
         if self.mouse is not None and self.tool.get() != "rotate":
             cv2.circle(img, (int(self.mouse[0]), int(self.mouse[1])), int(self.brush_var.get()), (220, 220, 220), 1, cv2.LINE_AA)
-        for k, g in enumerate(GROUPS):
-            cv2.putText(img, g, (10 + 52 * k, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, GROUP_COLORS[g], 1, cv2.LINE_AA)
         return img
     
     def set_image(self, label, bgr):
@@ -1783,23 +1785,36 @@ class FlyControllerApp:
         ttk.Button(side, text="Default layout", command=self.arena.default_layout).pack(fill=tk.X, pady=2)
         self.arena_info = tk.StringVar(value="")
         ttk.Label(side, textvariable=self.arena_info, justify=tk.LEFT).pack(anchor=tk.W, pady=(12, 0))
-        self.arena_canvas = tk.Canvas(parent, width=ARENA_PX, height=ARENA_PX, bg="#1d2a2c", highlightthickness=1,
+        self.arena_px = ARENA_PX
+        holder = ttk.Frame(parent)                         # the arena grows to fill all the free space, staying square
+        holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.arena_canvas = tk.Canvas(holder, width=ARENA_PX, height=ARENA_PX, bg="#1d2a2c", highlightthickness=1,
                                       highlightbackground="#888888", cursor="crosshair")
-        self.arena_canvas.pack(side=tk.LEFT)
+        self.arena_canvas.place(relx=0.5, rely=0.5, anchor="center", width=ARENA_PX, height=ARENA_PX)
+        holder.bind("<Configure>", self.arena_resize)
         self.arena_canvas.bind("<ButtonPress-1>", self.arena_click)
         self.arena_canvas.bind("<B1-Motion>", lambda e: self.arena_click(e, drag=True))
         self._arena_ver = -1
         self.trail = []
         self.update_arena_view()
+    def arena_resize(self, e):
+        n = int(max(240, min(e.width, e.height) - 12))
+        if n == getattr(self, "arena_px", 0):
+            return
+        self.arena_px = n
+        self.arena_canvas.place(relx=0.5, rely=0.5, anchor="center", width=n, height=n)
+        self._arena_ver = -1                               # redraw obstacles / food / grid at the new scale
+        if hasattr(self, "trail"):
+            self.update_arena_view()
     def reset_fly(self):
         self.body.reset()
         self.trail = []
     def _w2c(self, x, y):
-        sc = ARENA_PX / (2 * ARENA_HALF)
-        return ARENA_PX / 2 + x * sc, ARENA_PX / 2 - y * sc
+        sc = self.arena_px / (2 * ARENA_HALF)
+        return self.arena_px / 2 + x * sc, self.arena_px / 2 - y * sc
     def arena_click(self, e, drag=False):
-        sc = ARENA_PX / (2 * ARENA_HALF)
-        x, y = (e.x - ARENA_PX / 2) / sc, (ARENA_PX / 2 - e.y) / sc
+        sc = self.arena_px / (2 * ARENA_HALF)
+        x, y = (e.x - self.arena_px / 2) / sc, (self.arena_px / 2 - e.y) / sc
         if abs(x) > ARENA_HALF or abs(y) > ARENA_HALF:
             return
         tool = self.build_tool.get()
@@ -1816,16 +1831,16 @@ class FlyControllerApp:
             self.trail = []
     def update_arena_view(self):
         cv = self.arena_canvas
-        sc = ARENA_PX / (2 * ARENA_HALF)
+        sc = self.arena_px / (2 * ARENA_HALF)
         if self._arena_ver != self.arena.version:
             self._arena_ver = self.arena.version
             cv.delete("static")
             for g in range(-30, 40, 10):
                 a, _ = self._w2c(g, 0)
                 _, b = self._w2c(0, g)
-                cv.create_line(a, 0, a, ARENA_PX, fill="#27393b", tags="static")
-                cv.create_line(0, b, ARENA_PX, b, fill="#27393b", tags="static")
-            cv.create_rectangle(2, 2, ARENA_PX - 2, ARENA_PX - 2, outline="#8a9aa0", width=3, tags="static")
+                cv.create_line(a, 0, a, self.arena_px, fill="#27393b", tags="static")
+                cv.create_line(0, b, self.arena_px, b, fill="#27393b", tags="static")
+            cv.create_rectangle(2, 2, self.arena_px - 2, self.arena_px - 2, outline="#8a9aa0", width=3, tags="static")
             for ox, oy, r in self.arena.obstacles:
                 cx, cy = self._w2c(ox, oy)
                 cv.create_oval(cx - r * sc, cy - r * sc, cx + r * sc, cy + r * sc, fill="#7d8aa6", outline="#a9b4cc", tags="static")
