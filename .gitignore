@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+flyenv/
+# built brain + personal settings
+brain_subset.npz
+flylab_blooket_map.json
+# connectome data is NOT redistributed here
+data/
+*.feather
