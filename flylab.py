@@ -973,6 +973,10 @@ DRIVE_FULL_HZ = 40.0        # DN group rate (Hz) that counts as "full drive"
 BRAIN_DEADZONE = 0.15       # drive below this is ignored when the brain drives the keys
 ALL_KEYS = ['w', 'a', 's', 'd', 'up', 'down', 'left', 'right', 'space', 'q', '1', '2', '3', '4', 'enter']
 PREVIEW_MAX = 240  # longest side of the preview image in pixels
+MOTION_MIN_HOLD = 0.18         # s: a direction must last at least this long before it can change (stops A-D-A-D flicker)
+BLOOKET_CONFIRM = 0.25         # s: the same direction must be steady this long before an answer is chosen
+BLOOKET_COOLDOWN = 1.3         # s: minimum gap between two answers
+BLOOKET_REPEAT = 3.0           # s: keep heading the same way this long and the same answer is chosen again
 # BGR colours for the four descending-neuron groups in the neuron view
 GROUP_COLORS = {"fwd": (200, 120, 0), "back": (60, 100, 160), "left": (170, 170, 0), "right": (160, 60, 160)}
 def load_region():
@@ -1264,6 +1268,45 @@ class NeuroMechFlyBody:
             except Exception:
                 pass
             self.renderer = None
+class MotionFilter:
+    """Turns the jittery per-frame motion (dx, dy) into steady directions.
+    1. exponential smoothing   -> a fly wobbling left/right every frame averages out instead of flipping A-D-A-D
+    2. hysteresis              -> a direction switches on above `on` and only off below `off` (about half of it)
+    3. minimum hold time       -> a direction can't be flipped or dropped again for MOTION_MIN_HOLD seconds
+    Axis: dx > 0 = left (A), dy > 0 = forward (W), as in the rest of the program."""
+    def __init__(self):
+        self.vx = self.vy = 0.0
+        self.sx = self.sy = 0                # current direction on each axis: -1, 0, +1
+        self.tx = self.ty = 0.0              # time of the last change on each axis
+    def reset(self):
+        self.__init__()
+    def _axis(self, v, s, t, now, on, off):
+        if now - t < MOTION_MIN_HOLD:
+            return s, t
+        if s == 0:
+            n = 1 if v > on else (-1 if v < -on else 0)
+        elif s > 0:
+            n = -1 if v < -on else (0 if v < off else 1)
+        else:
+            n = 1 if v > on else (0 if v > -off else -1)
+        return (n, now) if n != s else (s, t)
+    def update(self, dx, dy, now, on, smoothing):
+        a = 1.0 - min(0.95, max(0.0, smoothing))             # weight of the newest frame
+        self.vx += a * (dx - self.vx)
+        self.vy += a * (dy - self.vy)
+        off = on * 0.5
+        self.sx, self.tx = self._axis(self.vx, self.sx, self.tx, now, on, off)
+        self.sy, self.ty = self._axis(self.vy, self.sy, self.ty, now, on, off)
+        return self.sx, self.sy
+    def dominant(self, on):
+        """The single strongest direction as 'W','S','A','D' (or None) - for modes that must pick exactly one."""
+        cx = abs(self.vx) / on if self.sx else 0.0
+        cy = abs(self.vy) / on if self.sy else 0.0
+        if cx == 0.0 and cy == 0.0:
+            return None
+        if cy >= cx:
+            return "W" if self.sy > 0 else "S"
+        return "A" if self.sx > 0 else "D"
 class FlyControllerApp:
     def __init__(self, root):
         self.root = root
@@ -1278,6 +1321,8 @@ class FlyControllerApp:
         self.game_mode = tk.StringVar(value="Classic")
         self.replay_enabled = tk.BooleanVar(value=False)
         self.source = tk.StringVar(value="")   # "brain" = simulation drives the keys, "screen" = optical flow
+        self.sens_var = tk.DoubleVar(value=0.10)       # motion needed to count as a direction
+        self.smooth_var = tk.DoubleVar(value=0.65)     # 0 = raw, higher = steadier but slower to react
         # Plain-Python mirrors of the Tk variables. Background threads read ONLY these.
         self.cfg = {
             "walk": self.walk_enabled.get(),
@@ -1287,11 +1332,13 @@ class FlyControllerApp:
             "game": self.game_mode.get(),
             "replay": self.replay_enabled.get(),
             "source": self.source.get(),
+            "sens": self.sens_var.get(),
+            "smooth": self.smooth_var.get(),
         }
         for key, var in (("walk", self.walk_enabled), ("macro", self.macro_enabled),
                          ("jump", self.jump_enabled), ("mode", self.input_mode),
                          ("game", self.game_mode), ("replay", self.replay_enabled),
-                         ("source", self.source)):
+                         ("source", self.source), ("sens", self.sens_var), ("smooth", self.smooth_var)):
             var.trace_add("write", lambda *_, k=key, v=var: self.cfg.__setitem__(k, v.get()))
         self.capture_region = load_region()
         self.blooket_modes, self.blooket_map = load_blooket_map()
@@ -1372,6 +1419,8 @@ class FlyControllerApp:
                           command=self.update_source_states).pack(anchor=tk.W, pady=2)
         ttk.Radiobutton(source_frame, text="Screen (optical flow on the captured fly area)", variable=self.source, value="screen",
                           command=self.update_source_states).pack(anchor=tk.W, pady=2)
+        self.make_slider(source_frame, "Sensitivity", self.sens_var, 0.03, 0.40, "{:.2f}", label_w=12)
+        self.make_slider(source_frame, "Smoothing", self.smooth_var, 0.0, 0.90, "{:.2f}", label_w=12)
         master_settings_frame = ttk.LabelFrame(main_frame, text=" Master Engine Settings ", padding="10")
         master_settings_frame.pack(fill=tk.X, pady=(10, 5))
         ttk.Checkbutton(master_settings_frame, text="Enable Fly Controller", variable=self.walk_enabled, command=self.clear_keys).pack(anchor=tk.W, pady=2)
@@ -2416,6 +2465,8 @@ class FlyControllerApp:
         sct = mss.mss()
         prev_gray, jump_cooldown, move_history, last_action, debounce_ticks = None, 0, [], "NONE", 0
         still_since, replay_armed = None, True
+        filt = MotionFilter()
+        bk_dir, bk_since, bk_last, bk_armed, bk_neutral, bk_fired = None, 0.0, 0.0, True, 0.0, None
         try:
             while not self.stop_event.is_set():
                 try:
@@ -2437,8 +2488,11 @@ class FlyControllerApp:
                         current_action = "NONE"
                         busy = (self.macro_in_progress or self.blooket_action_lock
                                 or self.selecting or self.replay_in_progress)
+                        now_t = time.monotonic()
+                        on_th = float(self.cfg["sens"])
+                        sdx, sdy = filt.update(dx, dy, now_t, on_th, float(self.cfg["smooth"]))
                         # --- AUTO-REPLAY: click play once the fly has been still long enough ---
-                        moving = max(abs(dx), abs(dy)) >= STILL_THRESHOLD
+                        moving = max(abs(filt.vx), abs(filt.vy)) >= on_th * 0.8
                         if not self.cfg["replay"]:
                             still_since, replay_armed = None, True
                         elif busy:
@@ -2462,28 +2516,40 @@ class FlyControllerApp:
                         if self.cfg["walk"] and not busy:
                             mode = self.cfg["mode"]
                             if mode == "blooket":
-                                if dy > 0.08:      # Fly Forward (W)  -> '2'
-                                    self.fire_blooket('2')
-                                elif dx > 0.08:    # Fly Left (A)     -> '1'
-                                    self.fire_blooket('1')
-                                elif dy < -0.08:   # Fly Backward (S) -> '4'
-                                    self.fire_blooket('4')
-                                elif dx < -0.08:   # Fly Right (D)    -> '3'
-                                    self.fire_blooket('3')
+                                # Pick ONE answer from the steadiest direction, once, then wait (no more 2222222...)
+                                d = filt.dominant(on_th)
+                                key = {"W": "2", "A": "1", "S": "4", "D": "3"}.get(d)
+                                if key is None:
+                                    if bk_neutral == 0.0:
+                                        bk_neutral = now_t
+                                    elif now_t - bk_neutral >= 0.25:
+                                        bk_armed = True                      # back to neutral: ready for the next answer
+                                    bk_dir = None
+                                else:
+                                    bk_neutral = 0.0
+                                    if key != bk_dir:
+                                        bk_dir, bk_since = key, now_t
+                                        if key != bk_fired:
+                                            bk_armed = True
+                                    if (not bk_armed and key == bk_fired and now_t - bk_last >= BLOOKET_REPEAT):
+                                        bk_armed = True                      # same heading for a long time: answer again
+                                    if bk_armed and now_t - bk_since >= BLOOKET_CONFIRM and now_t - bk_last >= BLOOKET_COOLDOWN:
+                                        self.fire_blooket(key)
+                                        bk_armed, bk_last, bk_fired = False, now_t, key
                             else:
                                 if mode == "wasd":
                                     uk, dk, lk, rk = 'w', 's', 'a', 'd'
                                 else:
                                     uk, dk, lk, rk = 'up', 'down', 'left', 'right'
-                                if dy > 0.08:
+                                if sdy > 0:
                                     self.hold(uk, True); self.hold(dk, False); current_action = "W"
-                                elif dy < -0.08:
+                                elif sdy < 0:
                                     self.hold(dk, True); self.hold(uk, False); current_action = "S"
                                 else:
                                     self.hold(uk, False); self.hold(dk, False)
-                                if dx > 0.08:
+                                if sdx > 0:
                                     self.hold(lk, True); self.hold(rk, False)
-                                elif dx < -0.08:
+                                elif sdx < 0:
                                     self.hold(rk, True); self.hold(lk, False)
                                 else:
                                     self.hold(lk, False); self.hold(rk, False)
@@ -2514,10 +2580,10 @@ class FlyControllerApp:
                         (PREVIEW_MAX, PREVIEW_MAX),
                     )
                     cx, cy = PREVIEW_MAX // 2, PREVIEW_MAX // 2
-                    ex = int(np.clip(cx + dx * 60, 0, PREVIEW_MAX - 1))
-                    ey = int(np.clip(cy + dy * 60, 0, PREVIEW_MAX - 1))
+                    ex = int(np.clip(cx + filt.vx * 60, 0, PREVIEW_MAX - 1))
+                    ey = int(np.clip(cy + filt.vy * 60, 0, PREVIEW_MAX - 1))
                     cv2.arrowedLine(frame, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.3)
-                    cv2.putText(frame, f"dx {dx:+.2f}  dy {dy:+.2f}", (5, 15),
+                    cv2.putText(frame, f"dx {filt.vx:+.2f}  dy {filt.vy:+.2f}  {'W' if filt.sy > 0 else 'S' if filt.sy < 0 else '-'}{'A' if filt.sx > 0 else 'D' if filt.sx < 0 else '-'}", (5, 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
                     ok, buf = cv2.imencode(".png", frame)
                     if ok:
