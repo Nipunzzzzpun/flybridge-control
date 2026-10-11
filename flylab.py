@@ -1442,6 +1442,7 @@ class FlyControllerApp:
         self.lab_t = time.perf_counter()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
+        self.root.after(500, self.open_graphs)
     # ------------------------------------------------------------------
     # BRAIN LAB (live simulation + neuron view + fly body view)
     # ------------------------------------------------------------------
@@ -1454,7 +1455,7 @@ class FlyControllerApp:
         self.brush_var = tk.DoubleVar(value=22.0)
         self.net_note = tk.StringVar(value="")
         self.show_skel = tk.BooleanVar(value=True)
-        self.blur_var = tk.DoubleVar(value=0.0)
+        self.blur_var = tk.DoubleVar(value=0.0)           # fixed at 0 = crisp (no slider any more)
         self.yaw, self.pitch, self.zoom = 0.0, 0.0, 1.7
         self.mouse = None
         self._imgs = {}
@@ -1585,7 +1586,6 @@ class FlyControllerApp:
         ttk.Button(row1, text="Reset brain", command=self.reset_brain).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row1, text="Clear painted", command=self.clear_paint).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row1, text="Reset view", command=self.reset_view).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(row1, text="Graphs", command=self.toggle_graphs).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(row1, text="Shapes", variable=self.show_skel).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(row1, text="   Tool:").pack(side=tk.LEFT)
         for text, val in (("Rotate", "rotate"), ("Paint", "paint"), ("Erase", "erase")):
@@ -1603,7 +1603,6 @@ class FlyControllerApp:
         self.make_slider(sliders, "Synapse gain", self.gain_var, 0.5, 8.0, "{:.2f}")
         self.make_slider(sliders, "Stim rate (Hz)", self.rate_var, 10, 300, "{:.0f}")
         self.make_slider(sliders, "Brush (px)", self.brush_var, 6, 70, "{:.0f}")
-        self.make_slider(sliders, "Blur (0 = crisp)", self.blur_var, 0.0, 2.0, "{:.1f}")
         self.status = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.status, font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
         ttk.Label(parent, textvariable=self.net_note, foreground="#666666").pack(anchor=tk.W)
@@ -1656,27 +1655,48 @@ class FlyControllerApp:
     # ------------------------------------------------------------------
     # GRAPHS POPUP: spikes, ping, and the direction (WASD) circle
     # ------------------------------------------------------------------
-    def toggle_graphs(self):
-        if self.graph_win is not None:
-            self.close_graphs()
+    def open_graphs(self):
+        """Opens the graphs window on startup, docked to the left of the main window (and it follows it)."""
+        if self.graph_win is not None or self.terminating:
             return
+        try:                                               # make room on the left of the screen for the graphs
+            self.root.update_idletasks()
+            need = GRAPH_PW + 14
+            rw, sw = self.root.winfo_width(), self.root.winfo_screenwidth()
+            x = max(self.root.winfo_x(), need)
+            if x + rw > sw:
+                x = max(0, sw - rw)
+            self.root.geometry(f"+{x}+{max(0, self.root.winfo_y())}")
+        except Exception:
+            pass
         win = tk.Toplevel(self.root)
         win.title("FlyLab Graphs")
         win.attributes("-topmost", True)
         win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", self.close_graphs)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)     # always docked beside the simulation
         self.graph_label = tk.Label(win, borderwidth=0, highlightthickness=0, bg="white")
         self.graph_label.pack()
         self.graph_win = win
-        try:                                               # dock it on the LEFT of the main window, as a vertical stack
+        self._graph_pos = None
+        self.dock_graphs()
+        self.draw_graphs()
+        self.root.after(200, self.follow_graphs)
+    def dock_graphs(self):
+        """Put the graphs window flush against the left edge of the main window."""
+        try:
             w, h = GRAPH_PW, 2 * GRAPH_TH + GRAPH_DH
-            self.root.update_idletasks()
             x = max(0, self.root.winfo_rootx() - w - 12)
-            y = max(0, min(self.root.winfo_rooty() - 30, win.winfo_screenheight() - h - 60))
-            win.geometry(f"{w}x{h}+{x}+{y}")
+            y = max(0, min(self.root.winfo_rooty() - 30, self.graph_win.winfo_screenheight() - h - 60))
+            if (x, y) != self._graph_pos:
+                self._graph_pos = (x, y)
+                self.graph_win.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
-        self.draw_graphs()
+    def follow_graphs(self):
+        if self.terminating or self.graph_win is None:
+            return
+        self.dock_graphs()
+        self.root.after(200, self.follow_graphs)
     def close_graphs(self):
         if self.graph_win is not None:
             try:
