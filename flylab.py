@@ -976,7 +976,7 @@ DRIVE_FULL_HZ = 40.0        # DN group rate (Hz) that counts as "full drive"
 BRAIN_DEADZONE = 0.15       # drive below this is ignored when the brain drives the keys
 ALL_KEYS = ['w', 'a', 's', 'd', 'up', 'down', 'left', 'right', 'space', 'q', '1', '2', '3', '4', 'enter']
 PREVIEW_MAX = 240  # longest side of the preview image in pixels
-GRAPH_PW, GRAPH_PH = 380, 300   # one graph panel in the Graphs window
+GRAPH_PW, GRAPH_TH, GRAPH_DH = 380, 240, 300   # Graphs window: panel width, time-graph height, direction-circle height (stacked vertically)
 GRAPH_SECONDS = 5.0            # time shown on the two time graphs
 MOTION_MIN_HOLD = 0.18         # s: a direction must last at least this long before it can change (stops A-D-A-D flicker)
 BLOOKET_CONFIRM = 0.25         # s: the same direction must be steady this long before an answer is chosen
@@ -1668,9 +1668,12 @@ class FlyControllerApp:
         self.graph_label = tk.Label(win, borderwidth=0, highlightthickness=0, bg="white")
         self.graph_label.pack()
         self.graph_win = win
-        try:                                               # dock it along the bottom of the screen, centred
-            w, h = 3 * GRAPH_PW, GRAPH_PH
-            win.geometry(f"{w}x{h}+{max(0, (win.winfo_screenwidth() - w) // 2)}+{max(0, win.winfo_screenheight() - h - 70)}")
+        try:                                               # dock it on the LEFT of the main window, as a vertical stack
+            w, h = GRAPH_PW, 2 * GRAPH_TH + GRAPH_DH
+            self.root.update_idletasks()
+            x = max(0, self.root.winfo_rootx() - w - 12)
+            y = max(0, min(self.root.winfo_rooty() - 30, win.winfo_screenheight() - h - 60))
+            win.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
         self.draw_graphs()
@@ -1693,7 +1696,7 @@ class FlyControllerApp:
         return max(v, floor)
     def _time_panel(self, title, ylabel, ts, ys, color, ymax, extra=None, note=""):
         """One white 'oscilloscope' panel: black axes, title on top, coloured line(s) over the last GRAPH_SECONDS."""
-        W, H = GRAPH_PW, GRAPH_PH
+        W, H = GRAPH_PW, GRAPH_TH
         img = np.full((H, W, 3), 255, np.uint8)
         x0, x1, y0, y1 = 56, W - 16, 38, H - 42
         cv2.putText(img, title, (x0 + 8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
@@ -1736,7 +1739,7 @@ class FlyControllerApp:
         return img
     def _direction_panel(self, tips, dirs, mag_txt, dead, full):
         """Circular 'direction' graph: the W / A / S / D regions, the dead zone, the motion arrow and its recent trail."""
-        W, H = GRAPH_PW, GRAPH_PH
+        W, H = GRAPH_PW, GRAPH_DH
         img = np.full((H, W, 3), 255, np.uint8)
         c = (W // 2, H // 2 + 10)
         R = min(W, H) // 2 - 40
@@ -1805,7 +1808,7 @@ class FlyControllerApp:
         tips = [(-r[4] / full, r[5] / full) for r in h[-30:]]
         mag = min(1.0, math.hypot(*self.last_motion) / full)
         g3 = self._direction_panel(tips, self.last_dirs, f"|v| {mag:.2f}", float(self.cfg.get("sens", 0.1)) / full, full)
-        return np.hstack([g1, g2, g3])
+        return np.vstack([g1, g2, g3])
     def toggle_run(self):
         self.user_run = not self.user_run
         self.run_btn.configure(text="Pause" if self.user_run else "Run")
