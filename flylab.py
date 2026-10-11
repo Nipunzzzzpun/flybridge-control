@@ -317,6 +317,7 @@ class Arena:
         self.half = ARENA_HALF
         self.obstacles, self.foods, self.food_spawn = [], [], []
         self.eaten = 0
+        self.smell_range = FOOD_RANGE                      # mm: how far the smell of food reaches (Build tab slider)
         self.version = 0                                   # bumped whenever the layout changes (UI redraw)
     def default_layout(self):
         self.obstacles = [[-14.0, 10.0, 4.0], [12.0, -8.0, 5.0], [18.0, 18.0, 3.0], [-20.0, -18.0, 4.5]]
@@ -376,10 +377,10 @@ class Arena:
         best = None
         for fx, fy, _amt in self.foods:
             d = math.hypot(fx - x, fy - y)
-            if d < FOOD_RANGE and (best is None or d < best[0]):
+            if d < self.smell_range and (best is None or d < best[0]):
                 best = (d, wrap_pi(math.atan2(fy - y, fx - x) - h))
         if best:
-            out["food"] = (1.0 - best[0] / FOOD_RANGE, best[1])
+            out["food"] = (1.0 - best[0] / self.smell_range, best[1])
         hf = self.half
         pts = [(ox, oy, r) for ox, oy, r in self.obstacles] + [(hf, y, 0.0), (-hf, y, 0.0), (x, hf, 0.0), (x, -hf, 0.0)]
         for ox, oy, r in pts:
@@ -1308,6 +1309,7 @@ class FlyControllerApp:
         # Keys currently held down (so we only send a key event when something actually changes)
         self.held = set()
         self.key_lock = threading.Lock()
+        self.keylog_q = queue.Queue()                      # key presses / clicks sent to the game, shown in the log box
         # Live brain + body
         self.init_brain()
         # UI: one window. Tab 1 = Brain Lab (left) + Fly Bridge controls (right). Tab 2 = MaleCNS setup.
@@ -1401,6 +1403,9 @@ class FlyControllerApp:
         self._imgs = {}
         self.sim = None
         self.arena_px = ARENA_PX
+        self._smell_hover = self._smell_drag = False
+        self._smell_img, self._smell_key = None, None
+        self.smell_show = False
         self.arena = Arena()
         self.arena.default_layout()
         self.body.arena = self.arena
@@ -1544,14 +1549,52 @@ class FlyControllerApp:
         self.status = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.status, font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
         ttk.Label(parent, textvariable=self.net_note, foreground="#666666").pack(anchor=tk.W)
-    def make_slider(self, parent, text, var, lo, hi, fmt):
+        log_box = ttk.LabelFrame(parent, text=" Key presses sent to the game ", padding=4)
+        log_box.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        log_row = ttk.Frame(log_box)
+        log_row.pack(fill=tk.BOTH, expand=True)
+        self.key_text = tk.Text(log_row, height=7, font=("Consolas", 9), state="disabled", wrap="none",
+                                bg="#fafafa", relief="flat", borderwidth=0)
+        log_sb = ttk.Scrollbar(log_row, orient=tk.VERTICAL, command=self.key_text.yview)
+        self.key_text.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.key_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Button(log_box, text="Clear log", command=self.clear_keylog).pack(anchor=tk.E, pady=(4, 0))
+    def make_slider(self, parent, text, var, lo, hi, fmt, label_w=14, command=None):
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=1)
-        ttk.Label(row, text=text, width=14).pack(side=tk.LEFT)
+        ttk.Label(row, text=text, width=label_w).pack(side=tk.LEFT)
         val = ttk.Label(row, text=fmt.format(var.get()), width=6)
         val.pack(side=tk.RIGHT)
-        ttk.Scale(row, from_=lo, to=hi, variable=var, orient=tk.HORIZONTAL,
-                  command=lambda _=None: val.configure(text=fmt.format(var.get()))).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        def changed(_=None):
+            val.configure(text=fmt.format(var.get()))
+            if command:
+                command()
+        scale = ttk.Scale(row, from_=lo, to=hi, variable=var, orient=tk.HORIZONTAL, command=changed)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        return scale
+    def clear_keylog(self):
+        self.key_text.configure(state="normal")
+        self.key_text.delete("1.0", "end")
+        self.key_text.configure(state="disabled")
+    def pump_keylog(self):
+        """UI thread: move queued key events into the log box (keeps the last 300 lines)."""
+        lines = []
+        try:
+            while len(lines) < 60:
+                lines.append(self.keylog_q.get_nowait())
+        except queue.Empty:
+            pass
+        if not lines:
+            return
+        t = self.key_text
+        t.configure(state="normal")
+        t.insert("end", "\n".join(lines) + "\n")
+        extra = int(t.index("end-1c").split(".")[0]) - 301
+        if extra > 0:
+            t.delete("1.0", f"{extra + 1}.0")
+        t.configure(state="disabled")
+        t.see("end")
     def toggle_run(self):
         self.user_run = not self.user_run
         self.run_btn.configure(text="Pause" if self.user_run else "Run")
@@ -1698,6 +1741,7 @@ class FlyControllerApp:
         """UI thread, ~30 fps: push slider values to the brain, move the body, redraw both views."""
         if self.terminating:
             return
+        self.pump_keylog()
         now = time.perf_counter()
         dt = min(now - self.lab_t, 0.1)
         self.lab_t = now
@@ -1778,7 +1822,17 @@ class FlyControllerApp:
         for text, val in (("Place obstacle", "obstacle"), ("Place food", "food"), ("Erase", "erase"), ("Move fly here", "fly")):
             ttk.Radiobutton(side, text=text, variable=self.build_tool, value=val).pack(anchor=tk.W, pady=1)
         self.obst_r_var = tk.DoubleVar(value=4.0)
-        self.make_slider(side, "Obstacle size (mm)", self.obst_r_var, 1.5, 9.0, "{:.1f}")
+        self.make_slider(side, "Obstacle size (mm)", self.obst_r_var, 1.5, 9.0, "{:.1f}", label_w=17)
+        self.smell_var = tk.DoubleVar(value=self.arena.smell_range)
+        smell_scale = self.make_slider(side, "Smell radius (mm)", self.smell_var, 3.0, 60.0, "{:.0f}", label_w=17,
+                                       command=self.on_smell)
+        smell_scale.bind("<Enter>", lambda e: self.set_smell_state(hover=True), add="+")
+        smell_scale.bind("<Leave>", lambda e: self.set_smell_state(hover=False), add="+")
+        smell_scale.bind("<ButtonPress-1>", lambda e: self.set_smell_state(drag=True), add="+")
+        smell_scale.bind("<ButtonRelease-1>", lambda e: self.set_smell_state(drag=False), add="+")
+        ttk.Label(side, wraplength=210, justify=tk.LEFT, foreground="#666666", text=(
+            "How far the smell of food reaches. Hover or drag this slider to see each food's range as a circle; "
+            "the fly only turns toward food inside it.")).pack(anchor=tk.W, pady=(0, 4))
         ttk.Button(side, text="Refill food", command=self.arena.refill).pack(fill=tk.X, pady=(12, 2))
         ttk.Button(side, text="Reset fly", command=self.reset_fly).pack(fill=tk.X, pady=2)
         ttk.Button(side, text="Clear everything", command=self.arena.clear).pack(fill=tk.X, pady=2)
@@ -1796,6 +1850,46 @@ class FlyControllerApp:
         self.arena_canvas.bind("<B1-Motion>", lambda e: self.arena_click(e, drag=True))
         self._arena_ver = -1
         self.trail = []
+        self.update_arena_view()
+    def smell_overlay(self, sc):
+        """Translucent smell circles for every food: 70% transparent fill and a 3 px border that is 40% transparent."""
+        n = int(self.arena_px)
+        r = self.arena.smell_range * sc
+        pts = tuple((int(round(self._w2c(fx, fy)[0])), int(round(self._w2c(fx, fy)[1]))) for fx, fy, _a in self.arena.foods)
+        key = (n, round(r, 1), pts)
+        if getattr(self, "_smell_key", None) == key and self._smell_img is not None:
+            return self._smell_img
+        fill = np.zeros((n, n), np.uint8)
+        ring = np.zeros((n, n), np.uint8)
+        for cx, cy in pts:
+            cv2.circle(fill, (cx, cy), int(round(r)), 255, -1, cv2.LINE_AA)
+            cv2.circle(ring, (cx, cy), int(round(r)), 255, 3, cv2.LINE_AA)
+        af = fill.astype(np.float32) / 255.0 * 0.30           # fill opacity 0.30  (= 0.7 transparent)
+        ab = ring.astype(np.float32) / 255.0 * 0.60           # border opacity 0.60 (= 0.4 transparent)
+        cf = np.array([31, 140, 240], np.float32)             # orange (BGR)
+        cb = np.array([110, 190, 255], np.float32)            # lighter orange for the border
+        a_out = ab + af * (1.0 - ab)
+        col = (cb * ab[..., None] + cf * (af * (1.0 - ab))[..., None]) / np.maximum(a_out, 1e-6)[..., None]
+        bgra = np.dstack([col, a_out * 255.0]).clip(0, 255).astype(np.uint8)
+        png = to_png(bgra)
+        if png is None:
+            return None
+        try:
+            self._smell_img = tk.PhotoImage(data=base64.b64encode(png))
+            self._smell_key = key
+        except tk.TclError:
+            self._smell_img = None
+        return self._smell_img
+    def on_smell(self):
+        self.arena.smell_range = float(self.smell_var.get())
+        self.update_arena_view()
+    def set_smell_state(self, hover=None, drag=None):
+        """The smell circles show while the pointer is over the slider or the slider is being dragged."""
+        if hover is not None:
+            self._smell_hover = hover
+        if drag is not None:
+            self._smell_drag = drag
+        self.smell_show = self._smell_hover or self._smell_drag
         self.update_arena_view()
     def arena_resize(self, e):
         n = int(max(240, min(e.width, e.height) - 12))
@@ -1853,6 +1947,11 @@ class FlyControllerApp:
         if not self.trail or math.hypot(b.x - self.trail[-1][0], b.y - self.trail[-1][1]) > 0.6:
             self.trail.append((b.x, b.y))
             self.trail = self.trail[-250:]
+        cv.delete("smell")
+        if self.smell_show and self.arena.foods:
+            img = self.smell_overlay(sc)
+            if img is not None:
+                cv.create_image(0, 0, anchor="nw", image=img, tags="smell")
         cv.delete("fly")
         if len(self.trail) > 1:
             pts = [c for x, y in self.trail for c in self._w2c(x, y)]
@@ -2181,7 +2280,12 @@ class FlyControllerApp:
     # ------------------------------------------------------------------
     # INPUT HELPERS
     # ------------------------------------------------------------------
+    def klog(self, text):
+        """Record one input event (thread-safe; the UI thread shows it)."""
+        t = time.time()
+        self.keylog_q.put(time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}  {text}")
     def hw_click(self, tx, ty):
+        self.klog(f"click   ({int(tx)}, {int(ty)})")
         pydirectinput.moveTo(int(tx), int(ty))
         time.sleep(0.08)
         pydirectinput.mouseDown()
@@ -2190,6 +2294,7 @@ class FlyControllerApp:
         time.sleep(0.05)
     def tap(self, key, hold_time=0.04):
         """A clean key tap that games register reliably."""
+        self.klog(f"tap     {key}")
         pydirectinput.keyDown(key)
         time.sleep(hold_time)
         pydirectinput.keyUp(key)
@@ -2197,13 +2302,17 @@ class FlyControllerApp:
         """Press/release a key only when its state actually changes."""
         with self.key_lock:
             if down and key not in self.held:
+                self.klog(f"down    {key}")
                 pydirectinput.keyDown(key)
                 self.held.add(key)
             elif not down and key in self.held:
+                self.klog(f"up      {key}")
                 pydirectinput.keyUp(key)
                 self.held.discard(key)
     def clear_keys(self):
         with self.key_lock:
+            if self.held:
+                self.klog("release " + " ".join(sorted(self.held)))
             for k in list(self.held):
                 pydirectinput.keyUp(k)
             self.held.clear()
