@@ -8,7 +8,7 @@ The fly body is the official NeuroMechFly model (FlyGym 2.x meshes). Its legs wa
 and the brain's descending-neuron drives steer it (forward / back / left / right).
 The brain view uses coordinates from brain_subset.npz (built from MaleCNS v1.0).
 
-Run:  python flylab.py
+Run:  python FlyLab_updated.py
 
 One-time install. FlyGym 2.x needs Python 3.12 or newer (check with:  python --version) and git.
 Use the SAME python for every line and to run this file (on Windows, e.g. replace "python" with "py -3.12"):
@@ -51,7 +51,7 @@ _ALPHA_RATE = DT / RATE_TAU
 # BGR colours: region 0 = central brain (purple), 1 = optic lobes (blue), 2 = nerve cord (amber)
 REGION_COLORS = np.array([(255, 140, 192), (255, 196, 96), (100, 186, 250)], np.float32)
 BG_BGR = np.array([39, 36, 16], np.float32)          # #102427, dark teal like the reference view
-MINT_BGR, FIRE_BGR = (190, 230, 110), (64, 176, 255)  # stimulated / firing
+MINT_BGR, FIRE_BGR = (190, 230, 110), (110, 215, 255)  # stimulated / firing
 def assign_regions(P, k=4, seed=0):
     """Visual guess of 0 = central brain, 1 = optic lobes, 2 = nerve cord from where the points sit."""
     P = np.asarray(P, np.float32)
@@ -303,6 +303,8 @@ AVOID_RANGE = 6.0          # mm, how far ahead it "sees" obstacles and walls
 EAT_RANGE = 1.6            # mm
 EAT_SECONDS = 4.0          # how long one food pellet takes to eat
 ENV_RATE_HZ = 200.0        # Poisson rate on a descending-neuron group at full command
+UP_POOL = 120              # strongest upstream (premotor) neurons per DN group that carry the command into the network
+UP_RATE_HZ = 24.0          # Poisson rate on those at full command, so activity visibly flows through the brain on the way to the DNs
 def wrap_pi(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 class Arena:
@@ -1231,7 +1233,7 @@ class NeuroMechFlyBody:
             msg = (self.error or "FlyGym not installed").replace("RuntimeError: ", "")
             for i, line in enumerate(textwrap.wrap(msg, 50)[:9]):
                 cv2.putText(img, line, (12, 70 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(img, "Install lines: top of flylab.py", (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.putText(img, "Install lines: top of FlyLab_updated.py", (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 60), 1, cv2.LINE_AA)
             return img
         now = time.perf_counter()
         if self._cached is not None and now - self._t_last < max(0.033, 2.5 * self._render_s):
@@ -1402,6 +1404,31 @@ class FlyControllerApp:
         self.preset_ids = {}
         self.preset_combo = None
         self.load_brain()
+    @staticmethod
+    def build_up_pools(net):
+        """For each DN group: the neurons that feed it most strongly (excluding the DNs themselves)."""
+        pools = {}
+        try:
+            Wr = net.W.tocsr()                      # W[post, pre]: row = receiving neuron
+            alld = np.concatenate([net.groups[g] for g in GROUPS])
+            S = {}
+            for g in GROUPS:
+                idx = net.groups[g]
+                st = np.zeros(net.n, np.float64)
+                if idx.size:
+                    st = np.asarray(Wr[idx, :].sum(axis=0)).ravel().astype(np.float64)
+                    st[alld] = 0.0
+                S[g] = st
+            for g in GROUPS:
+                others = np.max([S[h] for h in GROUPS if h != g], axis=0)
+                sel = S[g] - 2.0 * np.maximum(others, 0.0)      # feeds this group and (almost) none of the others
+                sel[sel < 0] = 0.0
+                k = min(UP_POOL, int((sel > 0).sum()))
+                pools[g] = np.argsort(sel)[::-1][:k].astype(np.int64) if k else np.zeros(0, np.int64)
+        except Exception as err:
+            print("[!] upstream pools unavailable:", err)
+            pools = {g: np.zeros(0, np.int64) for g in GROUPS}
+        return pools
     def load_brain(self):
         """(Re)load brain_subset.npz if it exists, otherwise the demo network, and start a fresh simulation."""
         try:
@@ -1417,6 +1444,7 @@ class FlyControllerApp:
         if self.sim is not None:
             self.sim.stop()
         self.net = net
+        self.up_pool = self.build_up_pools(net)
         self.stim_mask = np.zeros(net.n, bool)
         self._proj = (np.zeros(net.n),) * 3
         self.region_cols = REGION_COLORS[net.labels]
@@ -1604,7 +1632,7 @@ class FlyControllerApp:
             glow(simidx, self.stim_mask.astype(np.float32), MINT_BGR, 2.5)
         hot = np.flatnonzero(self.sim.flash > 0.05)
         if hot.size:
-            glow(simidx, self.sim.flash, FIRE_BGR, 3.0)
+            glow(simidx, self.sim.flash, FIRE_BGR, 3.0, sigma=max(1.3, blur * 1.6))   # firing neurons get a wider halo so activity is easy to see
         img = img.clip(0, 255).astype(np.uint8)
         if self.show_skel.get() and len(net.skel_edges):
             S = net.skel_pos
@@ -1664,6 +1692,7 @@ class FlyControllerApp:
                 lvl, bk, lt, rt = env_commands(sense, self.explorer.update(dt))
                 for key, val in (("fwd", lvl), ("back", bk), ("left", lt), ("right", rt)):
                     ext[self.net.groups[key]] = ENV_RATE_HZ * val
+                    ext[self.up_pool[key]] = np.maximum(ext[self.up_pool[key]], UP_RATE_HZ * val)
             elif mode != BASE_LABEL:                       # a BadApple-fly movement program: stimulate its neurons
                 sides = {"Both": ("L", "R"), "Left": ("L",), "Right": ("R",)}[self.side_var.get()]
                 for sd in sides:
