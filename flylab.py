@@ -976,7 +976,7 @@ DRIVE_FULL_HZ = 40.0        # DN group rate (Hz) that counts as "full drive"
 BRAIN_DEADZONE = 0.15       # drive below this is ignored when the brain drives the keys
 ALL_KEYS = ['w', 'a', 's', 'd', 'up', 'down', 'left', 'right', 'space', 'q', '1', '2', '3', '4', 'enter']
 PREVIEW_MAX = 240  # longest side of the preview image in pixels
-GRAPH_PW, GRAPH_TH, GRAPH_DH = 380, 240, 300   # Graphs window: panel width, time-graph height, direction-circle height (stacked vertically)
+GRAPH_PW, GRAPH_TH, GRAPH_DH, GRAPH_AH = 360, 215, 275, 250   # Graphs column: panel width, time-graph height, direction-circle height (stacked vertically)
 GRAPH_SECONDS = 5.0            # time shown on the two time graphs
 MOTION_MIN_HOLD = 0.18         # s: a direction must last at least this long before it can change (stops A-D-A-D flicker)
 BLOOKET_CONFIRM = 0.25         # s: the same direction must be steady this long before an answer is chosen
@@ -1385,6 +1385,11 @@ class FlyControllerApp:
 
         content_frame = ttk.Frame(tab_ctrl)
         content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        graph_frame = ttk.Frame(content_frame, padding=(15, 15, 0, 15))      # the graphs live in this window, on the left
+        graph_frame.pack(side=tk.LEFT, fill=tk.Y)
+        self.graph_label = tk.Label(graph_frame, borderwidth=0, highlightthickness=1, highlightbackground="#bbbbbb", bg="white")
+        self.graph_label.pack(anchor=tk.N)
+        self.graph_win = graph_frame
         lab_frame = ttk.Frame(content_frame, padding=(15, 15, 0, 15))
         lab_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.build_lab(lab_frame)
@@ -1442,7 +1447,6 @@ class FlyControllerApp:
         self.lab_t = time.perf_counter()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
-        self.root.after(500, self.open_graphs)
     # ------------------------------------------------------------------
     # BRAIN LAB (live simulation + neuron view + fly body view)
     # ------------------------------------------------------------------
@@ -1655,55 +1659,6 @@ class FlyControllerApp:
     # ------------------------------------------------------------------
     # GRAPHS POPUP: spikes, ping, and the direction (WASD) circle
     # ------------------------------------------------------------------
-    def open_graphs(self):
-        """Opens the graphs window on startup, docked to the left of the main window (and it follows it)."""
-        if self.graph_win is not None or self.terminating:
-            return
-        try:                                               # make room on the left of the screen for the graphs
-            self.root.update_idletasks()
-            need = GRAPH_PW + 14
-            rw, sw = self.root.winfo_width(), self.root.winfo_screenwidth()
-            x = max(self.root.winfo_x(), need)
-            if x + rw > sw:
-                x = max(0, sw - rw)
-            self.root.geometry(f"+{x}+{max(0, self.root.winfo_y())}")
-        except Exception:
-            pass
-        win = tk.Toplevel(self.root)
-        win.title("FlyLab Graphs")
-        win.attributes("-topmost", True)
-        win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", lambda: None)     # always docked beside the simulation
-        self.graph_label = tk.Label(win, borderwidth=0, highlightthickness=0, bg="white")
-        self.graph_label.pack()
-        self.graph_win = win
-        self._graph_pos = None
-        self.dock_graphs()
-        self.draw_graphs()
-        self.root.after(200, self.follow_graphs)
-    def dock_graphs(self):
-        """Put the graphs window flush against the left edge of the main window."""
-        try:
-            w, h = GRAPH_PW, 2 * GRAPH_TH + GRAPH_DH
-            x = max(0, self.root.winfo_rootx() - w - 12)
-            y = max(0, min(self.root.winfo_rooty() - 30, self.graph_win.winfo_screenheight() - h - 60))
-            if (x, y) != self._graph_pos:
-                self._graph_pos = (x, y)
-                self.graph_win.geometry(f"{w}x{h}+{x}+{y}")
-        except Exception:
-            pass
-    def follow_graphs(self):
-        if self.terminating or self.graph_win is None:
-            return
-        self.dock_graphs()
-        self.root.after(200, self.follow_graphs)
-    def close_graphs(self):
-        if self.graph_win is not None:
-            try:
-                self.graph_win.destroy()
-            except Exception:
-                pass
-        self.graph_win = self.graph_label = None
     def draw_graphs(self):
         if self.graph_win is not None and self.graph_label is not None:
             self.set_image(self.graph_label, self.render_graphs())
@@ -1806,6 +1761,38 @@ class FlyControllerApp:
         cv2.putText(img, f"{mag_txt}   keys: {keys}", (12, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1, cv2.LINE_AA)
         cv2.rectangle(img, (0, 0), (W - 1, H - 1), (190, 190, 190), 1)
         return img
+    def _heading_panel(self, heading):
+        """Compass-style dial showing the fly's body angle (0 deg = up on the Build map, clockwise)."""
+        W, H = GRAPH_PW, GRAPH_AH
+        img = np.full((H, W, 3), 255, np.uint8)
+        c = (W // 2, H // 2 + 8)
+        R = min(W, H) // 2 - 44
+        deg = (90.0 - math.degrees(heading)) % 360.0
+        cv2.putText(img, "Fly angle (heading)", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.circle(img, c, R, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.circle(img, c, R - 14, (170, 170, 170), 1, cv2.LINE_AA)
+        for a in range(0, 360, 10):
+            r = math.radians(a - 90)
+            ln = 12 if a % 30 == 0 else 6
+            p0 = (int(c[0] + (R - ln) * math.cos(r)), int(c[1] + (R - ln) * math.sin(r)))
+            p1 = (int(c[0] + R * math.cos(r)), int(c[1] + R * math.sin(r)))
+            cv2.line(img, p0, p1, (0, 0, 0), 1, cv2.LINE_AA)
+            if a % 30 == 0:
+                t = str(a)
+                (tw, th), _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+                q = (int(c[0] + (R + 17) * math.cos(r)) - tw // 2, int(c[1] + (R + 17) * math.sin(r)) + th // 2)
+                cv2.putText(img, t, q, cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.line(img, (c[0] - R + 14, c[1]), (c[0] + R - 14, c[1]), (200, 200, 200), 1)
+        cv2.line(img, (c[0], c[1] - R + 14), (c[0], c[1] + R - 14), (200, 200, 200), 1)
+        r = math.radians(deg - 90)
+        tip = (int(c[0] + (R - 16) * math.cos(r)), int(c[1] + (R - 16) * math.sin(r)))
+        tail = (int(c[0] - 0.35 * R * math.cos(r)), int(c[1] - 0.35 * R * math.sin(r)))
+        cv2.line(img, tail, c, (150, 150, 150), 2, cv2.LINE_AA)
+        cv2.arrowedLine(img, c, tip, (200, 60, 20), 3, cv2.LINE_AA, tipLength=0.2)
+        cv2.circle(img, c, 4, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.putText(img, f"{deg:5.1f} deg", (W - 100, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 60, 20), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (0, 0), (W - 1, H - 1), (190, 190, 190), 1)
+        return img
     def render_graphs(self):
         h = list(self.hist)
         tnow = h[-1][0] if h else 0.0
@@ -1828,7 +1815,8 @@ class FlyControllerApp:
         tips = [(-r[4] / full, r[5] / full) for r in h[-30:]]
         mag = min(1.0, math.hypot(*self.last_motion) / full)
         g3 = self._direction_panel(tips, self.last_dirs, f"|v| {mag:.2f}", float(self.cfg.get("sens", 0.1)) / full, full)
-        return np.vstack([g1, g2, g3])
+        g4 = self._heading_panel(float(getattr(self.body, 'heading', 0.0)) if getattr(self, 'body', None) is not None else 0.0)
+        return np.vstack([g1, g2, g3, g4])
     def toggle_run(self):
         self.user_run = not self.user_run
         self.run_btn.configure(text="Pause" if self.user_run else "Run")
