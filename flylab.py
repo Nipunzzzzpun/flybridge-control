@@ -20,6 +20,7 @@ In the app:  Control Panel = live brain + NeuroMechFly body (drag the fly to rot
 (Dynamic environment = the fly wanders by itself, or any BadApple-fly movement program), Build tab = place obstacles and food.
 Template alignment (optional, navis transforms tutorial):  python -m pip install navis flybrains h5py
 """
+from collections import deque
 import random, ctypes, os, sys, json, time, threading, base64, math, re, queue, warnings, textwrap
 # Make Windows report real pixels to everything (Tk, screen capture, clicks) so coordinates all agree.
 try:
@@ -213,6 +214,7 @@ class LIFSim:
             self._last = np.zeros(0, np.int64)
             self._pop = 0.0
             self.t_ms = 0.0
+            self.n_spk = 0                 # total spikes so far (the Graphs window reads this)
             for k in self.rates:
                 self.rates[k] = 0.0
     def set_stim(self, mask):
@@ -257,6 +259,7 @@ class LIFSim:
             self.v[spk] = V_RESET
             self.ref[spk] = T_REF
         self._last = spk
+        self.n_spk += int(spk.size)
         self._pop += 0.02 * (spk.size / self.net.n - self._pop)     # global activity level (about 50 ms memory)
         self.flash *= _DECAY_FLASH
         self.flash[spk] = 1.0
@@ -973,6 +976,8 @@ DRIVE_FULL_HZ = 40.0        # DN group rate (Hz) that counts as "full drive"
 BRAIN_DEADZONE = 0.15       # drive below this is ignored when the brain drives the keys
 ALL_KEYS = ['w', 'a', 's', 'd', 'up', 'down', 'left', 'right', 'space', 'q', '1', '2', '3', '4', 'enter']
 PREVIEW_MAX = 240  # longest side of the preview image in pixels
+GRAPH_PW, GRAPH_PH = 380, 300   # one graph panel in the Graphs window
+GRAPH_SECONDS = 5.0            # time shown on the two time graphs
 MOTION_MIN_HOLD = 0.18         # s: a direction must last at least this long before it can change (stops A-D-A-D flicker)
 BLOOKET_CONFIRM = 0.25         # s: the same direction must be steady this long before an answer is chosen
 BLOOKET_COOLDOWN = 1.3         # s: minimum gap between two answers
@@ -1356,6 +1361,9 @@ class FlyControllerApp:
         # Keys currently held down (so we only send a key event when something actually changes)
         self.held = set()
         self.key_lock = threading.Lock()
+        self.last_motion, self.last_dirs = (0.0, 0.0), (0, 0)
+        self.hist = deque(maxlen=900)                      # (time, spikes/s, drive, loop ms, motion x, motion y) for the graphs
+        self._spk_prev, self.graph_win, self.graph_label = 0, None, None
         self.keylog_q = queue.Queue()                      # key presses / clicks sent to the game, shown in the log box
         # Live brain + body
         self.init_brain()
@@ -1577,6 +1585,7 @@ class FlyControllerApp:
         ttk.Button(row1, text="Reset brain", command=self.reset_brain).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row1, text="Clear painted", command=self.clear_paint).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row1, text="Reset view", command=self.reset_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row1, text="Graphs", command=self.toggle_graphs).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(row1, text="Shapes", variable=self.show_skel).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(row1, text="   Tool:").pack(side=tk.LEFT)
         for text, val in (("Rotate", "rotate"), ("Paint", "paint"), ("Erase", "erase")):
@@ -1644,6 +1653,159 @@ class FlyControllerApp:
             t.delete("1.0", f"{extra + 1}.0")
         t.configure(state="disabled")
         t.see("end")
+    # ------------------------------------------------------------------
+    # GRAPHS POPUP: spikes, ping, and the direction (WASD) circle
+    # ------------------------------------------------------------------
+    def toggle_graphs(self):
+        if self.graph_win is not None:
+            self.close_graphs()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("FlyLab Graphs")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close_graphs)
+        self.graph_label = tk.Label(win, borderwidth=0, highlightthickness=0, bg="white")
+        self.graph_label.pack()
+        self.graph_win = win
+        try:                                               # dock it along the bottom of the screen, centred
+            w, h = 3 * GRAPH_PW, GRAPH_PH
+            win.geometry(f"{w}x{h}+{max(0, (win.winfo_screenwidth() - w) // 2)}+{max(0, win.winfo_screenheight() - h - 70)}")
+        except Exception:
+            pass
+        self.draw_graphs()
+    def close_graphs(self):
+        if self.graph_win is not None:
+            try:
+                self.graph_win.destroy()
+            except Exception:
+                pass
+        self.graph_win = self.graph_label = None
+    def draw_graphs(self):
+        if self.graph_win is not None and self.graph_label is not None:
+            self.set_image(self.graph_label, self.render_graphs())
+    @staticmethod
+    def _nice_max(v, floor):
+        for c in (1, 2, 5):
+            for e in range(-1, 8):
+                if c * 10 ** e >= max(v * 1.1, floor):
+                    return c * 10 ** e
+        return max(v, floor)
+    def _time_panel(self, title, ylabel, ts, ys, color, ymax, extra=None, note=""):
+        """One white 'oscilloscope' panel: black axes, title on top, coloured line(s) over the last GRAPH_SECONDS."""
+        W, H = GRAPH_PW, GRAPH_PH
+        img = np.full((H, W, 3), 255, np.uint8)
+        x0, x1, y0, y1 = 56, W - 16, 38, H - 42
+        cv2.putText(img, title, (x0 + 8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
+        def X(t):
+            return int(x0 + (t + GRAPH_SECONDS) / GRAPH_SECONDS * (x1 - x0))
+        def Y(v):
+            return int(y1 - min(max(v, 0.0), ymax) / ymax * (y1 - y0))
+        for k in range(0, int(GRAPH_SECONDS) + 1):          # x ticks
+            xx = X(-GRAPH_SECONDS + k)
+            cv2.line(img, (xx, y1), (xx, y1 + 4), (0, 0, 0), 1)
+            cv2.putText(img, str(-int(GRAPH_SECONDS) + k), (xx - 6, y1 + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(img, "s", (x1 - 6, y1 + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+        for k in range(0, 5):                               # y ticks
+            v = ymax * k / 4.0
+            yy = Y(v)
+            cv2.line(img, (x0 - 4, yy), (x0, yy), (0, 0, 0), 1)
+            lab = f"{v:.0f}" if ymax >= 10 else f"{v:.1f}"
+            cv2.putText(img, lab, (x0 - 8 - 7 * len(lab), yy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(img, ylabel, (6, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.line(img, (x0, y0), (x0, y1), (0, 0, 0), 1)     # axes
+        cv2.line(img, (x0, y1), (x1, y1), (0, 0, 0), 1)
+        if extra:
+            for (et, ev, ecol, edash, elabel) in extra:
+                if not len(et):
+                    continue
+                pts = np.array([(X(t), Y(v)) for t, v in zip(et, ev)], np.int32)
+                if edash:
+                    for i in range(0, len(pts) - 1, 2):
+                        cv2.line(img, tuple(pts[i]), tuple(pts[i + 1]), ecol, 1, cv2.LINE_AA)
+                else:
+                    cv2.polylines(img, [pts.reshape(-1, 1, 2)], False, ecol, 1, cv2.LINE_AA)
+                cv2.putText(img, elabel, (x1 - 8 * len(elabel) - 6, y0 + 14 + 14 * extra.index((et, ev, ecol, edash, elabel))),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, ecol, 1, cv2.LINE_AA)
+        if len(ts) > 1:
+            pts = np.array([(X(t), Y(v)) for t, v in zip(ts, ys)], np.int32)
+            cv2.polylines(img, [pts.reshape(-1, 1, 2)], False, color, 2, cv2.LINE_AA)
+        if note:
+            cv2.putText(img, note, (x0 + 8, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 60, 60), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (0, 0), (W - 1, H - 1), (190, 190, 190), 1)
+        return img
+    def _direction_panel(self, tips, dirs, mag_txt, dead, full):
+        """Circular 'direction' graph: the W / A / S / D regions, the dead zone, the motion arrow and its recent trail."""
+        W, H = GRAPH_PW, GRAPH_PH
+        img = np.full((H, W, 3), 255, np.uint8)
+        c = (W // 2, H // 2 + 10)
+        R = min(W, H) // 2 - 40
+        cv2.putText(img, "Direction (W A S D)", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
+        sx, sy = dirs
+        active = {"W": sy > 0, "S": sy < 0, "A": sx > 0, "D": sx < 0}
+        # sector centres on screen: W up, D right, S down, A left (cv2 angles: 0 = right, clockwise)
+        spans = {"D": (-45, 45), "S": (45, 135), "A": (135, 225), "W": (225, 315)}
+        soft = {"W": (214, 238, 208), "D": (246, 226, 205), "S": (212, 214, 246), "A": (200, 236, 246)}
+        strong = {"W": (120, 210, 110), "D": (235, 170, 90), "S": (120, 130, 240), "A": (70, 200, 240)}
+        for k, (a0, a1) in spans.items():
+            cv2.ellipse(img, c, (R, R), 0, a0, a1, strong[k] if active[k] else soft[k], -1, cv2.LINE_AA)
+        for ang in (45, 135, 225, 315):                      # region borders
+            a = math.radians(ang)
+            cv2.line(img, c, (int(c[0] + R * math.cos(a)), int(c[1] + R * math.sin(a))), (150, 150, 150), 1, cv2.LINE_AA)
+        cv2.circle(img, c, R, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.line(img, (c[0] - R - 8, c[1]), (c[0] + R + 8, c[1]), (0, 0, 0), 1)
+        cv2.line(img, (c[0], c[1] - R - 8), (c[0], c[1] + R + 8), (0, 0, 0), 1)
+        dr = int(R * min(1.0, dead))
+        if dr > 2:
+            cv2.circle(img, c, dr, (120, 120, 120), 1, cv2.LINE_AA)
+        for k, (lx, ly) in {"W": (c[0] - 7, c[1] - R + 26), "S": (c[0] - 7, c[1] + R - 14), "A": (c[0] - R + 14, c[1] + 6),
+                            "D": (c[0] + R - 28, c[1] + 6)}.items():
+            cv2.putText(img, k, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0) if active[k] else (110, 110, 110), 2 if active[k] else 1, cv2.LINE_AA)
+        for txt, (tx, ty) in (("0", (c[0] - 4, c[1] - R - 12)), ("90", (c[0] + R + 10, c[1] - 6)),
+                              ("180", (c[0] - 12, c[1] + R + 20)), ("270", (c[0] - R - 34, c[1] - 6))):
+            cv2.putText(img, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(img, "1.0", (c[0] + R - 24, c[1] + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 1, cv2.LINE_AA)
+        def unit(p):
+            m = math.hypot(*p)
+            return (p[0] / m, p[1] / m) if m > 1.0 else p
+        tips = [unit(t) for t in tips]
+        n = len(tips)
+        for i, (px, py) in enumerate(tips):                  # trail, oldest = faintest
+            q = (int(c[0] + R * max(-1, min(1, px))), int(c[1] - R * max(-1, min(1, py))))
+            g = int(235 - 190 * (i + 1) / max(1, n))
+            cv2.circle(img, q, 2, (255, g, g), -1, cv2.LINE_AA)
+        if tips:
+            px, py = tips[-1]
+            tip = (int(c[0] + R * max(-1, min(1, px))), int(c[1] - R * max(-1, min(1, py))))
+            cv2.arrowedLine(img, c, tip, (200, 60, 20), 2, cv2.LINE_AA, tipLength=0.14)
+        cv2.circle(img, c, 3, (0, 0, 0), -1, cv2.LINE_AA)
+        keys = "+".join(k for k in "WASD" if active[k]) or "-"
+        cv2.putText(img, f"{mag_txt}   keys: {keys}", (12, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (0, 0), (W - 1, H - 1), (190, 190, 190), 1)
+        return img
+    def render_graphs(self):
+        h = list(self.hist)
+        tnow = h[-1][0] if h else 0.0
+        h = [r for r in h if r[0] >= tnow - GRAPH_SECONDS - 0.05]
+        ts = [r[0] - tnow for r in h]
+        sp = np.array([r[1] for r in h], np.float32)
+        if sp.size >= 4:                                     # ~100 ms smoothing
+            sp = np.convolve(np.pad(sp, (3, 0), mode="edge"), np.ones(4, np.float32) / 4, mode="valid")
+        smax = self._nice_max(float(np.percentile(sp, 97)) if sp.size else 0.0, 100.0)   # one burst can't squash the graph
+        drive = [r[2] * smax * 0.25 for r in h]               # stimulus drawn as a quarter-height trace, like the reference
+        g1 = self._time_panel("Spikes vs Time", "spikes/s", ts, sp, (40, 40, 220), smax,
+                              extra=[(ts, drive, (60, 170, 40), False, "Stimulus (drive)")],
+                              note=f"now {sp[-1]:.0f}/s" if sp.size else "")
+        ping = [r[3] for r in h]
+        pmax = self._nice_max(float(np.percentile(ping, 97)) if ping else 0.0, 50.0)   # one slow frame can't squash the graph
+        g2 = self._time_panel("Ping vs Time", "ms", ts, ping, (40, 40, 220), pmax,
+                              extra=[([-GRAPH_SECONDS, 0.0], [33.3, 33.3], (60, 170, 40), True, "33 ms target")],
+                              note=(f"now {ping[-1]:.0f} ms   avg {sum(ping) / len(ping):.0f} ms" if ping else ""))
+        full = 1.0 if self.cfg.get("source") == "brain" else 0.8
+        tips = [(-r[4] / full, r[5] / full) for r in h[-30:]]
+        mag = min(1.0, math.hypot(*self.last_motion) / full)
+        g3 = self._direction_panel(tips, self.last_dirs, f"|v| {mag:.2f}", float(self.cfg.get("sens", 0.1)) / full, full)
+        return np.hstack([g1, g2, g3])
     def toggle_run(self):
         self.user_run = not self.user_run
         self.run_btn.configure(text="Pause" if self.user_run else "Run")
@@ -1792,6 +1954,7 @@ class FlyControllerApp:
             return
         self.pump_keylog()
         now = time.perf_counter()
+        t_start = now
         dt = min(now - self.lab_t, 0.1)
         self.lab_t = now
         self.sim.gain = float(self.gain_var.get())
@@ -1855,6 +2018,13 @@ class FlyControllerApp:
             f"spikes/s {self.sim.spikes_per_s:7.0f}  painted {int(self.stim_mask.sum())}\n"
             f"drive  fwd {fwd:.2f}  back {back:.2f}  left {left:.2f}  right {right:.2f}   food eaten {self.arena.eaten}"
             + ("" if self.sim.running else ("\nPAUSED - press Run" if brain_selected else "\nPAUSED - choose 'Brain simulation' as the source (Fly Bridge section)")))
+        n_spk = self.sim.n_spk
+        rate = max(0, n_spk - self._spk_prev) / max(dt, 0.01) if (self.sim.running and self.hist) else 0.0
+        self._spk_prev = n_spk
+        self.hist.append((now, rate, max(fwd, back, left, right), (time.perf_counter() - t_start) * 1000.0,
+                          self.last_motion[0], self.last_motion[1]))
+        if self.graph_win is not None and self.frame_i % 2 == 0:
+            self.draw_graphs()
         self.root.after(33, self.update_lab)
     # ------------------------------------------------------------------
     # BUILD TAB: place obstacles and food for the fly
@@ -2491,6 +2661,7 @@ class FlyControllerApp:
                         now_t = time.monotonic()
                         on_th = float(self.cfg["sens"])
                         sdx, sdy = filt.update(dx, dy, now_t, on_th, float(self.cfg["smooth"]))
+                        self.last_motion, self.last_dirs = (filt.vx, filt.vy), (sdx, sdy)   # for the Graphs window
                         # --- AUTO-REPLAY: click play once the fly has been still long enough ---
                         moving = max(abs(filt.vx), abs(filt.vy)) >= on_th * 0.8
                         if not self.cfg["replay"]:
