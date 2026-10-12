@@ -1328,6 +1328,7 @@ class FlyControllerApp:
         self.source = tk.StringVar(value="")   # "brain" = simulation drives the keys, "screen" = optical flow
         self.sens_var = tk.DoubleVar(value=0.10)       # motion needed to count as a direction
         self.smooth_var = tk.DoubleVar(value=0.65)     # 0 = raw, higher = steadier but slower to react
+        self.directional_var = tk.BooleanVar(value=False)   # Advanced: keys follow the fly's compass heading, not its body axes
         # Plain-Python mirrors of the Tk variables. Background threads read ONLY these.
         self.cfg = {
             "walk": self.walk_enabled.get(),
@@ -1339,11 +1340,13 @@ class FlyControllerApp:
             "source": self.source.get(),
             "sens": self.sens_var.get(),
             "smooth": self.smooth_var.get(),
+            "directional": self.directional_var.get(),
         }
         for key, var in (("walk", self.walk_enabled), ("macro", self.macro_enabled),
                          ("jump", self.jump_enabled), ("mode", self.input_mode),
                          ("game", self.game_mode), ("replay", self.replay_enabled),
-                         ("source", self.source), ("sens", self.sens_var), ("smooth", self.smooth_var)):
+                         ("source", self.source), ("sens", self.sens_var), ("smooth", self.smooth_var),
+                         ("directional", self.directional_var)):
             var.trace_add("write", lambda *_, k=key, v=var: self.cfg.__setitem__(k, v.get()))
         self.capture_region = load_region()
         self.blooket_modes, self.blooket_map = load_blooket_map()
@@ -1440,6 +1443,14 @@ class FlyControllerApp:
         ttk.Checkbutton(master_settings_frame, text="Enable Jump Inputs (Space)", variable=self.jump_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Enable Block Placement Macro (WSW Combo)", variable=self.macro_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Auto-Replay Mode", variable=self.replay_enabled).pack(anchor=tk.W, pady=2)
+        adv_frame = ttk.LabelFrame(main_frame, text=" Advanced ", padding="10")
+        adv_frame.pack(fill=tk.X, pady=(5, 5))
+        ttk.Checkbutton(adv_frame, text="Directional", variable=self.directional_var).pack(anchor=tk.W, pady=2)
+        ttk.Label(adv_frame, foreground="#555555", wraplength=420, justify=tk.LEFT,
+                  text="Off (default): the fly walking forward presses W, backward S, and so on.\n"
+                       "On: keys follow the direction the fly is actually heading on the map "
+                       "(Build tab): heading south presses S, west presses A, north W, east D. "
+                       "Applies to the Brain source.").pack(anchor=tk.W)
         self.update_mode_states()
         self.vision_thread = threading.Thread(target=self.run_vision, daemon=True)
         self.vision_thread.start()
@@ -1871,6 +1882,14 @@ class FlyControllerApp:
             dy = 0.0
         if abs(dx) < BRAIN_DEADZONE:
             dx = 0.0
+        if self.cfg.get("directional"):
+            # Turn the body-frame push (forward dy, leftward dx) into a map-frame push using the fly's heading
+            # (0 = +x / east, counter-clockwise, +y = north): north -> W, south -> S, west -> A, east -> D.
+            h = float(getattr(self.body, "heading", 0.0))
+            ch, sh = math.cos(h), math.sin(h)
+            wx = dy * ch - dx * sh                        # east component
+            wy = dy * sh + dx * ch                        # north component
+            dy, dx = wy, -wx                              # north = "forward" (W), west = "left" (A)
         return dx, dy
     def render_cloud(self):
         """Density-splat view: every neuron adds a soft glow, coloured by region, over a dark teal background."""
