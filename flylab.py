@@ -937,6 +937,7 @@ SPAWN_GROUND_X, SPAWN_GROUND_Y = 1430, 420
 GAME_MODES = ["Classic", "Gold Quest"]
 BLOOKET_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_blooket_map.json")
 MAP_STEPS = [("1", "ANSWER 1"), ("2", "ANSWER 2"), ("3", "ANSWER 3"), ("4", "ANSWER 4"), ("continue", "the CONTINUE / SUBMIT button")]
+MINI_W, MINI_H = 660, 320                                  # window size on the "Minimized" page
 FOOD_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_food_key.json")
 def load_food_key():
     try:
@@ -1410,6 +1411,11 @@ class FlyControllerApp:
         self.nb.add(tab_ctrl, text="   Control Panel   ")
         self.nb.add(tab_build, text="   Build (obstacles & food)   ")
         self.nb.add(tab_setup, text="   MaleCNS Setup   ")
+        tab_min = ttk.Frame(self.nb)
+        self.nb.add(tab_min, text="   Minimized   ")
+        self.build_minimized(tab_min)
+        self.tab_min = tab_min
+        self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.build_arena_tab(tab_build)
         self.build_setup(tab_setup)
         self.root.after(600, self.auto_build)
@@ -2404,6 +2410,30 @@ class FlyControllerApp:
             self.game_combo.config(state="disabled")
             self.map_btn.state(["disabled"])
             self.add_mode_btn.state(["disabled"])
+    def build_minimized(self, parent):
+        """4th page: a tiny 'parked' state. Selecting it shrinks the whole window; any other tab restores it."""
+        try:
+            import tkinter.font as tkfont
+            fams = set(tkfont.families(self.root))
+        except Exception:
+            fams = set()
+        medium = next((f for f in ("Montserrat Medium", "Montserrat") if f in fams), "Segoe UI")
+        normal = "Montserrat" if "Montserrat" in fams else "Segoe UI"
+        big = 22
+        small = max(7, round(big * 0.4))                       # smaller text = 0.4 x the middle text
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        box = tk.Frame(parent, bg=bg)
+        box.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(box, text="Minimized", bg=bg, font=(medium, big)).pack()
+        tk.Label(box, text="Select a page to start", bg=bg, fg="#555555", font=(normal, small)).pack(pady=(2, 0))
+    def on_tab_changed(self, _e=None):
+        try:
+            if self.nb.select() == str(self.tab_min):
+                self.root.geometry(f"{MINI_W}x{MINI_H}")
+            else:
+                self.root.geometry("")                         # back to the natural (full) size
+        except Exception:
+            pass
     def refresh_food_box(self):
         if self.food_key:
             self.food_lbl.configure(text=self.food_key.upper(), fg="black")
