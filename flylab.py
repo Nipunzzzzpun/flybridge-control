@@ -1412,10 +1412,11 @@ class FlyControllerApp:
         self.nb.add(tab_build, text="   Build (obstacles & food)   ")
         self.nb.add(tab_setup, text="   MaleCNS Setup   ")
         tab_min = ttk.Frame(self.nb)
-        self.nb.add(tab_min, text="   Minimized   ")
+        self.nb.add(tab_min, text="   Minimize   ")
         self.build_minimized(tab_min)
         self.tab_min = tab_min
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        self.nb.select(tab_min)                                # start parked on the Minimize page
         self.build_arena_tab(tab_build)
         self.build_setup(tab_setup)
         self.root.after(600, self.auto_build)
@@ -2425,6 +2426,13 @@ class FlyControllerApp:
         box = tk.Frame(parent, bg=bg)
         box.place(relx=0.5, rely=0.5, anchor="center")
         tk.Label(box, text="Minimized", bg=bg, font=(medium, big)).pack()
+        # Inset ("pressed in") pixel-style note, top left, like an old Windows pop-up: light copy offset 1 px under a dark copy.
+        pix = next((f for f in ("Terminal", "Fixedsys", "MS Sans Serif") if f in fams), "Consolas")
+        note = "Neeche tool isn't it?"
+        cv = tk.Canvas(parent, width=230, height=22, bg=bg, highlightthickness=0, bd=0)
+        cv.place(x=10, y=8)
+        cv.create_text(2, 12, text=note, anchor="w", font=(pix, 9), fill="#ffffff")
+        cv.create_text(1, 11, text=note, anchor="w", font=(pix, 9), fill="#7a7a7a")
         tk.Label(box, text="Select a page to start", bg=bg, fg="#555555", font=(normal, small)).pack(pady=(2, 0))
     def on_tab_changed(self, _e=None):
         try:
