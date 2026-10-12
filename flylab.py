@@ -1055,7 +1055,7 @@ class NeuroMechFlyBody:
     STEPMAX, LIFT, STANCE = 1.0, 0.35, 0.6       # mm of foot travel per step, mm foot lift, fraction of the cycle on the ground
     V_MAX, W_MAX = 22.0, 4.5                     # commanded mm/s and rad/s at full drive (feet slip, so real motion is lower)
     F_MAX, F_MIN = 16.0, 6.0                     # Hz, step frequency limits while walking
-    KP, ADHESION = 50.0, 1.0                    # joint motor stiffness, foot adhesion gain
+    KP, ADHESION = 50.0, 3.0                    # joint motor stiffness, foot adhesion gain
     EFF_V, EFF_W = 0.30, 0.22                    # how much of the commanded walk / turn the body is expected to achieve
     YAW_ASSIST = 0.0                             # 0..1: how strongly a gyro-like yaw-rate reflex trims the turning (0 = legs only)
     TURN_RATE = 0.35                             # achieved body turn rate (rad/s) per rad/s of turn command
@@ -1064,7 +1064,7 @@ class NeuroMechFlyBody:
     K_V, K_W = 0.0, 0.0                          # feedback trim strength (1/s)
     PRESS = 0.0                                  # mm: how far the stance feet push into the ground
     FORCE_MAX = 100.0                            # motor torque limit
-    FRICTION = 1.0                               # foot-ground sliding friction
+    FRICTION = 2.0                               # foot-ground sliding friction
     PHYS_DT = 3e-4                               # s, physics time step
     FEED_ANGLES = np.array([-1.1, -0.9])         # rad: rostrum / haustellum pitch at full proboscis extension
 
