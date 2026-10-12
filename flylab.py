@@ -937,6 +937,32 @@ SPAWN_GROUND_X, SPAWN_GROUND_Y = 1430, 420
 GAME_MODES = ["Classic", "Gold Quest"]
 BLOOKET_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_blooket_map.json")
 MAP_STEPS = [("1", "ANSWER 1"), ("2", "ANSWER 2"), ("3", "ANSWER 3"), ("4", "ANSWER 4"), ("continue", "the CONTINUE / SUBMIT button")]
+FOOD_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_food_key.json")
+def load_food_key():
+    try:
+        with open(FOOD_KEY_FILE) as f:
+            return str(json.load(f).get("key", "")) or ""
+    except Exception:
+        return ""
+def save_food_key(key):
+    try:
+        with open(FOOD_KEY_FILE, "w") as f:
+            json.dump({"key": key}, f)
+    except Exception as err:
+        print(f"[!] Couldn't save the food key: {err}")
+_KEYSYM_TO_KEY = {"Return": "enter", "KP_Enter": "enter", "space": "space", "Tab": "tab", "BackSpace": "backspace",
+                  "Up": "up", "Down": "down", "Left": "left", "Right": "right", "Shift_L": "shift", "Shift_R": "shift",
+                  "Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt", "Delete": "delete",
+                  "Home": "home", "End": "end", "Prior": "pageup", "Next": "pagedown", "Insert": "insert"}
+def keysym_to_key(sym):
+    """Tk keysym -> a pydirectinput key name ('' if it can't be used)."""
+    if sym in _KEYSYM_TO_KEY:
+        return _KEYSYM_TO_KEY[sym]
+    if len(sym) == 1:
+        return sym.lower()
+    if sym[:1] == "F" and sym[1:].isdigit() and 1 <= int(sym[1:]) <= 12:
+        return sym.lower()
+    return ""
 def load_blooket_map():
     """-> (list of game modes, {mode: {'1': [x, y], ..., 'continue': [x, y]}})"""
     modes, maps = list(GAME_MODES), {}
@@ -1328,6 +1354,8 @@ class FlyControllerApp:
         self.source = tk.StringVar(value="")   # "brain" = simulation drives the keys, "screen" = optical flow
         self.sens_var = tk.DoubleVar(value=0.10)       # motion needed to count as a direction
         self.smooth_var = tk.DoubleVar(value=0.65)     # 0 = raw, higher = steadier but slower to react
+        self.food_key = load_food_key()                     # Advanced: tapped each time the fly finishes a food pellet ('' = off)
+        self.food_seen = 0
         self.directional_var = tk.BooleanVar(value=False)   # Advanced: keys follow the fly's compass heading, not its body axes
         # Plain-Python mirrors of the Tk variables. Background threads read ONLY these.
         self.cfg = {
@@ -1413,6 +1441,28 @@ class FlyControllerApp:
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         ttk.Radiobutton(left_col, text="WASD Layout", variable=self.input_mode, value="wasd", command=self.update_mode_states).pack(anchor=tk.W, pady=6)
         ttk.Radiobutton(left_col, text="Arrows Layout", variable=self.input_mode, value="arrows", command=self.update_mode_states).pack(anchor=tk.W, pady=6)
+        adv_frame = ttk.LabelFrame(left_col, text=" Advanced ", padding="6")
+        adv_frame.pack(fill=tk.X, pady=(8, 0))
+        dir_cb = ttk.Checkbutton(adv_frame, text="Directional", variable=self.directional_var)
+        dir_cb.pack(anchor=tk.W)
+        food_row = ttk.Frame(adv_frame)
+        food_row.pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(food_row, text="Map food to").pack(side=tk.LEFT)
+        self.food_box = tk.Frame(food_row, bg="white", highlightthickness=1, highlightbackground="#888888", takefocus=1)
+        self.food_box.pack(side=tk.LEFT, padx=(6, 0))
+        self.food_lbl = tk.Label(self.food_box, bg="white", width=7, anchor="center", font=("Segoe UI", 9, "bold"))
+        self.food_lbl.pack(side=tk.LEFT, ipady=2)
+        self.food_trash = tk.Label(self.food_box, text="\U0001F5D1", bg="white", fg="#888888", cursor="hand2", font=("Segoe UI Emoji", 9))
+        self.food_trash.pack(side=tk.RIGHT, padx=(0, 3))
+        self.food_trash.bind("<Button-1>", lambda e: self.set_food_key(""))
+        self.food_trash.bind("<Enter>", lambda e: self.food_trash.configure(fg="#cc0000"))
+        self.food_trash.bind("<Leave>", lambda e: self.food_trash.configure(fg="#888888"))
+        self.food_listening = False
+        self.food_box.bind("<Enter>", lambda e: self.food_listen(True))     # hover = listen, then just press a key
+        self.food_box.bind("<Leave>", lambda e: self.food_listen(False))
+        self.food_lbl.bind("<Enter>", lambda e: self.food_listen(True))
+        self.food_box.bind("<KeyPress>", self.food_keypress)
+        self.refresh_food_box()
         right_col = ttk.LabelFrame(columns_frame, text=" Blooket Layouts ", padding="10")
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
         ttk.Radiobutton(right_col, text="Activate Blooket", variable=self.input_mode, value="blooket", command=self.update_mode_states).pack(anchor=tk.W, pady=(0, 4))
@@ -1443,14 +1493,6 @@ class FlyControllerApp:
         ttk.Checkbutton(master_settings_frame, text="Enable Jump Inputs (Space)", variable=self.jump_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Enable Block Placement Macro (WSW Combo)", variable=self.macro_enabled).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(master_settings_frame, text="Auto-Replay Mode", variable=self.replay_enabled).pack(anchor=tk.W, pady=2)
-        adv_frame = ttk.LabelFrame(main_frame, text=" Advanced ", padding="10")
-        adv_frame.pack(fill=tk.X, pady=(5, 5))
-        ttk.Checkbutton(adv_frame, text="Directional", variable=self.directional_var).pack(anchor=tk.W, pady=2)
-        ttk.Label(adv_frame, foreground="#555555", wraplength=420, justify=tk.LEFT,
-                  text="Off (default): the fly walking forward presses W, backward S, and so on.\n"
-                       "On: keys follow the direction the fly is actually heading on the map "
-                       "(Build tab): heading south presses S, west presses A, north W, east D. "
-                       "Applies to the Brain source.").pack(anchor=tk.W)
         self.update_mode_states()
         self.vision_thread = threading.Thread(target=self.run_vision, daemon=True)
         self.vision_thread.start()
@@ -2038,6 +2080,10 @@ class FlyControllerApp:
                 ft = 1.0 if feeding else 0.0               # (old brain file without MN9: extend while eating)
             self.body.feed += (ft - self.body.feed) * min(1.0, dt * 5.0)
             self.body.step(fwd, back, left, right, dt)
+        eaten = self.arena.eaten
+        if eaten > self.food_seen and self.food_key and self.cfg["walk"]:
+            threading.Thread(target=self.tap, args=(self.food_key,), daemon=True).start()   # one tap per pellet eaten
+        self.food_seen = eaten
         self.frame_i = getattr(self, "frame_i", 0) + 1
         if self.frame_i % 3 == 0:
             self.update_arena_view()
@@ -2358,6 +2404,29 @@ class FlyControllerApp:
             self.game_combo.config(state="disabled")
             self.map_btn.state(["disabled"])
             self.add_mode_btn.state(["disabled"])
+    def refresh_food_box(self):
+        if self.food_key:
+            self.food_lbl.configure(text=self.food_key.upper(), fg="black")
+        else:
+            self.food_lbl.configure(text="none", fg="#999999")
+        self.food_trash.configure(state="normal")
+    def food_listen(self, on):
+        self.food_listening = on
+        if on:
+            self.food_box.focus_set()
+        else:
+            self.root.focus_set()
+        self.refresh_food_box()
+    def food_keypress(self, event):
+        if event.keysym == "Escape":
+            return
+        k = keysym_to_key(event.keysym)
+        if k:
+            self.set_food_key(k)
+    def set_food_key(self, key):
+        self.food_key = key
+        save_food_key(key)
+        self.refresh_food_box()
     def update_source_states(self):
         """Only allow selecting a capture area when Screen is the active fly source."""
         screen_selected = self.source.get() == "screen"
