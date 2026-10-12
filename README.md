@@ -38,6 +38,20 @@ python flylab.py
 ```
 FlyGym 2.x is installed from GitHub (`flygym @ git+https://github.com/NeLy-EPFL/flygym.git@v2.1.0`); an old PyPI FlyGym 1.x will not work.
 
+## Updating
+If you cloned the repo, pull the latest version and refresh the dependencies:
+```powershell
+cd FlyLab
+git pull
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt --upgrade
+python flylab.py
+```
+Your saved screen region and key map (`flylab_*.json`) are git-ignored, so `git pull` will not overwrite them.
+If `git pull` complains about local changes, run `git stash` first (or `git checkout flylab.py` to discard your edits).
+If you downloaded a ZIP instead, download the new ZIP and replace `flylab.py` (and `requirements.txt`).
+Check the [Releases](../../releases) page for what changed.
+
 ## Get the data (not included)
 The connectome is **not** redistributed here. Download **MaleCNS v1.0** yourself, follow its licence and citation
 requirements, and point the *MaleCNS Setup* tab at the folder. Either:
