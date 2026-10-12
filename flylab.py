@@ -48,7 +48,11 @@ RATE_TAU = 150.0                           # ms, smoothing of the DN group rates
 GROUPS = ("fwd", "back", "left", "right")
 _DECAY_SYN = float(np.exp(-DT / TAU_SYN))
 _DECAY_FLASH = float(np.exp(-DT / FLASH_TAU))
+ACT_TAU = 350.0                            # ms, slow 'recent activity' trace: smooth glow of what the network has been doing
+_DECAY_ACT = float(np.exp(-DT / ACT_TAU))
 _ALPHA_RATE = DT / RATE_TAU
+ADAPT_TAU, ADAPT_JUMP = 300.0, 0.4          # spike-frequency adaptation: ms, mV added per spike (stops activity latching on forever)
+_DECAY_ADAPT = float(np.exp(-DT / ADAPT_TAU))
 # BGR colours: region 0 = central brain (purple), 1 = optic lobes (blue), 2 = nerve cord (amber)
 REGION_COLORS = np.array([(255, 140, 192), (255, 196, 96), (100, 186, 250)], np.float32)
 BG_BGR = np.array([39, 36, 16], np.float32)          # #102427, dark teal like the reference view
@@ -211,6 +215,8 @@ class LIFSim:
             self.g = np.zeros(n, np.float32)
             self.ref = np.zeros(n, np.float32)
             self.flash = np.zeros(n, np.float32)
+            self.act = np.zeros(n, np.float32)
+            self.adapt = np.zeros(n, np.float32)
             self._last = np.zeros(0, np.int64)
             self._pop = 0.0
             self.t_ms = 0.0
@@ -252,17 +258,22 @@ class LIFSim:
                 self.g[hit] += EXT_W * W_SYN
         # membrane update (clamped while refractory)
         free = self.ref <= 0
-        self.v += (V_REST - self.v + self.g) * (DT / TAU_M) * free
+        self.v += (V_REST - self.v + self.g - self.adapt) * (DT / TAU_M) * free
         self.ref -= DT
         spk = np.flatnonzero(self.v >= V_THRESH)
         if spk.size:
             self.v[spk] = V_RESET
             self.ref[spk] = T_REF
+        self.adapt *= _DECAY_ADAPT
+        if spk.size:
+            self.adapt[spk] += ADAPT_JUMP
         self._last = spk
         self.n_spk += int(spk.size)
         self._pop += 0.02 * (spk.size / self.net.n - self._pop)     # global activity level (about 50 ms memory)
         self.flash *= _DECAY_FLASH
         self.flash[spk] = 1.0
+        self.act *= _DECAY_ACT
+        self.act[spk] += 0.3
         self.t_ms += DT
         # DN group rates (Hz per neuron, exponentially smoothed)
         cnt = np.bincount(self.gid[spk][self.gid[spk] >= 0], minlength=len(GROUPS))
@@ -272,7 +283,9 @@ class LIFSim:
         return spk.size
     def drives(self, full_hz=40.0):
         """(fwd, back, left, right), each 0..1 (full_hz = group rate that counts as 'full drive')."""
-        return tuple(min(1.0, self.rates[g] / full_hz) for g in GROUPS)
+        rf, rb, rl, rr = (self.rates[g] / full_hz for g in GROUPS)
+        ny, nx = rf - rb, rl - rr                           # opposing descending groups cancel (push-pull), like antagonist muscles
+        return (min(1.0, max(0.0, ny)), min(1.0, max(0.0, -ny)), min(1.0, max(0.0, nx)), min(1.0, max(0.0, -nx)))
     # ---- background thread -------------------------------------------------
     def start(self):
         if self._thread is None:
@@ -311,7 +324,7 @@ ENV_RATE_HZ = 600.0        # Poisson rate on a descending-neuron group at full c
 UP_POOL = 120              # strongest upstream (premotor) neurons per DN group that carry the command into the network
 POP_REF = 0.0025           # population rate (spikes per neuron per ms, = 2.5 Hz) above which global inhibition damps the synapses
 UP_GAIN_POW = 1.0          # the stronger the synapse gain slider, the weaker this extra drive (keeps the network from running away)
-UP_RATE_HZ = 24.0          # Poisson rate on those at full command, so activity visibly flows through the brain on the way to the DNs
+UP_RATE_HZ = 100.0          # Poisson rate on those at full command, so activity visibly flows through the brain on the way to the DNs
 def wrap_pi(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 class Arena:
@@ -419,7 +432,7 @@ def env_commands(sense, wander, explore=True):
     if food is not None:
         st, th = food
         mix = min(1.0, st * 2.5)
-        lvl = (1 - mix) * lvl + mix * (0.35 + 0.65 * max(0.0, 1.0 - abs(th) / 1.0))
+        lvl = (1 - mix) * lvl + mix * 0.9 * max(0.0, 1.0 - abs(th) / 0.45)      # turn on the spot until the food is ahead, then walk to it
         turn = (1 - mix) * turn + mix * float(np.clip(th / 0.7, -1.0, 1.0))
     ol, orr, front = sense["obst_l"], sense["obst_r"], sense["front"]
     av = max(ol, orr)
@@ -937,6 +950,7 @@ SPAWN_GROUND_X, SPAWN_GROUND_Y = 1430, 420
 GAME_MODES = ["Classic", "Gold Quest"]
 BLOOKET_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_blooket_map.json")
 MAP_STEPS = [("1", "ANSWER 1"), ("2", "ANSWER 2"), ("3", "ANSWER 3"), ("4", "ANSWER 4"), ("continue", "the CONTINUE / SUBMIT button")]
+MOTOR_W = 860                                             # width of the Motor Properties picture
 MINI_W, MINI_H = 660, 320                                  # window size on the "Minimized" page
 FOOD_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_food_key.json")
 def load_food_key():
@@ -1024,19 +1038,34 @@ def to_png(img):
     ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     return buf.tobytes() if ok else None
 class NeuroMechFlyBody:
-    """The real NeuroMechFly model (FlyGym 2.x meshes) walking on a ground plane.
+    """The real NeuroMechFly model (FlyGym 2.x meshes) simulated with real physics in MuJoCo.
 
-    The legs follow a tripod gait solved with inverse kinematics, and the body is moved
-    kinematically (no contact physics), so it stays stable and is steered directly by the
-    brain's descending-neuron drives:
-        speed = (fwd - back) * V_MAX            turn rate = (right - left) * W_MAX
+    Every leg joint is a position-controlled motor, the body is a free-floating rigid body with gravity and
+    ground contact, and the feet grip with adhesion pads during stance. The brain's descending-neuron
+    drives set a walking command; a tripod gait (inverse kinematics) turns that command into joint targets,
+    and the body is only moved by the forces the feet push against the ground, so it can tilt and slip:
+        walk speed ~ (fwd - back) * V_MAX            turn rate ~ (right - left) * W_MAX
     If FlyGym / MuJoCo are missing, the panel shows the reason instead of a stand-in drawing.
     """
     LEGS = ("lf", "lm", "lh", "rf", "rm", "rh")
+    LEG_NAMES = {"lf": "Left front leg", "lm": "Left middle leg", "lh": "Left hind leg",
+                 "rf": "Right front leg", "rm": "Right middle leg", "rh": "Right hind leg"}
     TRIPOD = {"lf": 0.0, "rm": 0.0, "lh": 0.0, "rf": 0.5, "lm": 0.5, "rh": 0.5}
-    STEP_LEN, LIFT, STANCE = 0.8, 0.35, 0.6      # mm, mm, fraction of the cycle spent on the ground
-    V_MAX, W_MAX, HALF_TRACK = 9.0, 3.0, 1.2     # mm/s, rad/s, mm
-    F_MAX = 14.0                                 # Hz, step frequency cap
+    HIND_LIFT = 3.0                                # the heavy hind legs need a higher swing to really clear the ground
+    STEPMAX, LIFT, STANCE = 1.0, 0.35, 0.6       # mm of foot travel per step, mm foot lift, fraction of the cycle on the ground
+    V_MAX, W_MAX = 22.0, 4.5                     # commanded mm/s and rad/s at full drive (feet slip, so real motion is lower)
+    F_MAX, F_MIN = 16.0, 6.0                     # Hz, step frequency limits while walking
+    KP, ADHESION = 50.0, 1.0                    # joint motor stiffness, foot adhesion gain
+    EFF_V, EFF_W = 0.30, 0.22                    # how much of the commanded walk / turn the body is expected to achieve
+    YAW_ASSIST = 0.0                             # 0..1: how strongly a gyro-like yaw-rate reflex trims the turning (0 = legs only)
+    TURN_RATE = 0.35                             # achieved body turn rate (rad/s) per rad/s of turn command
+    YAW_KP, YAW_KI, YAW_TMAX, YAW_IMAX = 1.5, 6.0, 6.0, 1.0   # turning reflex gains / limits
+    BIAS_W = 14.0                                # rad/s, largest turn trim the feedback may add
+    K_V, K_W = 0.0, 0.0                          # feedback trim strength (1/s)
+    PRESS = 0.0                                  # mm: how far the stance feet push into the ground
+    FORCE_MAX = 100.0                            # motor torque limit
+    FRICTION = 1.0                               # foot-ground sliding friction
+    PHYS_DT = 3e-4                               # s, physics time step
     FEED_ANGLES = np.array([-1.1, -0.9])         # rad: rostrum / haustellum pitch at full proboscis extension
 
     def __init__(self, w, h):
@@ -1044,12 +1073,18 @@ class NeuroMechFlyBody:
         self.error = None
         self.renderer = None
         self.x = self.y = self.heading = 0.0
+        self.pitch = self.roll = 0.0
         self.arena = None                                  # Arena: obstacles / food drawn in the 3D view and used for collisions
         self.groom = 0.0                                   # 0..1: raise the front legs into a grooming motion
         self.feed = 0.0                                    # 0..1: extend the proboscis
         self.prob_adr = np.zeros(0, int)
         self._groom_t = 0.0
         self.trail = []
+        self.rt_factor = 0.0                               # simulated seconds per wall second
+        self.speed_mm_s = 0.0
+        self.n_contacts = 0
+        self.leg_force = np.zeros(6)                       # summed ground contact force per leg (uN)
+        self.contact_draw = []                             # [(pos xyz, force xyz)] for the 3D view
         self._cached, self._t_last, self._render_s = None, 0.0, 0.0
         try:
             self._build()
@@ -1075,7 +1110,7 @@ class NeuroMechFlyBody:
     def _build(self):
         self._check_install()
         import mujoco as mj
-        from flygym.compose import NeuroMechFly, FlatGroundWorld, KinematicPosePreset
+        from flygym.compose import NeuroMechFly, FlatGroundWorld, KinematicPosePreset, ActuatorType, ContactParams
         from flygym.anatomy import Skeleton, JointPreset, AxisOrder
         from flygym.utils.math import Rotation3D
         self.mj = mj
@@ -1091,23 +1126,56 @@ class NeuroMechFlyBody:
                 skeleton = Skeleton(joint_preset=JointPreset.LEGS_ONLY, axis_order=AxisOrder.PITCH_ROLL_YAW)
             fly.add_joints(skeleton, neutral_pose=KinematicPosePreset.NEUTRAL)
             fly.colorize()
+            fly.add_actuators(fly.get_jointdofs_order(), ActuatorType.POSITION, neutral_input=KinematicPosePreset.NEUTRAL,
+                              kp=self.KP, forcerange=(-self.FORCE_MAX, self.FORCE_MAX))
+            fly.add_leg_adhesion(gain=self.ADHESION)
             fly.add_tracking_camera(name="trackcam")
             world = FlatGroundWorld()
-            world.add_fly(fly, [0, 0, 0.7], Rotation3D("quat", [1, 0, 0, 0]))
+            world.add_fly(fly, [0, 0, 0.7], Rotation3D("quat", [1, 0, 0, 0]),
+                          ground_contact_params=ContactParams(sliding_friction=self.FRICTION))
             self.model, self.data = world.compile()
         m, d = self.model, self.data
-        key = mj.mj_name2id(m, mj.mjtObj.mjOBJ_KEY, "neutral")
-        mj.mj_resetDataKeyframe(m, d, key)
-        mj.mj_forward(m, d)
+        m.opt.timestep = self.PHYS_DT
+        self.key = mj.mj_name2id(m, mj.mjtObj.mjOBJ_KEY, "neutral")
         bid = lambda n: mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, n)
         jid = lambda n: mj.mj_name2id(m, mj.mjtObj.mjOBJ_JOINT, n)
-        # lift the fly so its lowest foot just touches the ground plane
-        tips = {leg: bid(f"nmf/{leg}_tarsus5") for leg in self.LEGS}
-        lowest = min(d.xpos[b][2] for b in tips.values())
-        d.qpos[2] += 0.12 - lowest
-        mj.mj_forward(m, d)
-        self.q_neutral = d.qpos.copy()
+        # --- actuator tables: which joint each motor drives, which are adhesion pads -----------------------
+        self.adh = {}
+        pos_a, self.act_q, self.act_v, self.act_info = [], [], [], []
+        for i in range(m.nu):
+            name = mj.mj_id2name(m, mj.mjtObj.mjOBJ_ACTUATOR, i) or ""
+            if name.endswith("-adhesion"):
+                self.adh[name.split("/")[1][:2]] = i
+                continue
+            j = int(m.actuator_trnid[i][0])
+            if j < 0:
+                continue
+            jn = (mj.mj_id2name(m, mj.mjtObj.mjOBJ_JOINT, j) or "").split("/")[-1]       # e.g. lf_coxa-lf_trochanterfemur-pitch
+            parent, child, axis = (jn.split("-") + ["", "", ""])[:3]
+            leg = child[:2] if child[:2] in self.LEGS and child[2:3] == "_" else "head"
+            part = child.split("_", 1)[1] if "_" in child else child
+            pos_a.append(i)
+            self.act_q.append(int(m.jnt_qposadr[j]))
+            self.act_v.append(int(m.jnt_dofadr[j]))
+            self.act_info.append((leg, f"{part} {axis}"))
+        self.pos_act = np.array(pos_a, int)
+        self.act_q, self.act_v = np.array(self.act_q, int), np.array(self.act_v, int)
+        # body id -> leg index (for ground-contact forces)
+        self.body_leg = np.full(m.nbody, -1, int)
+        for b in range(m.nbody):
+            nm = (mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, b) or "").split("/")[-1]
+            if nm[:2] in self.LEGS and nm[2:3] == "_":
+                self.body_leg[b] = self.LEGS.index(nm[:2])
+        # --- let it drop onto the ground and settle, then remember the neutral joint angles ------------------
+        mj.mj_resetDataKeyframe(m, d, self.key)
+        self.ctrl_neutral = d.ctrl.copy()                  # the keyframe's motor targets = the neutral standing pose
+        for i in self.adh.values():
+            d.ctrl[i] = 1.0
+        for _ in range(int(0.3 / self.PHYS_DT)):
+            mj.mj_step(m, d)
         self.root_z = float(d.qpos[2])
+        self.q_neutral = d.qpos.copy()
+        self.q_neutral[:7] = [0, 0, self.root_z, 1, 0, 0, 0]
         self.ik = mj.MjData(m)                       # scratch copy used to solve the legs with the body held still
         self.ik.qpos[:] = self.q_neutral
         mj.mj_forward(m, self.ik)
@@ -1119,8 +1187,17 @@ class NeuroMechFlyBody:
             ids = [jid(n) for n in names]
             self.qadr[leg] = np.array([m.jnt_qposadr[i] for i in ids])
             self.dadr[leg] = np.array([m.jnt_dofadr[i] for i in ids])
-            self.tip_body[leg] = tips[leg]
-            self.tip0[leg] = self.ik.xpos[tips[leg]].copy()
+            self.tip_body[leg] = bid(f"nmf/{leg}_tarsus5")
+            self.tip0[leg] = self.ik.xpos[self.tip_body[leg]].copy()
+        # per-motor frequency tracking (zero crossings of each joint angle)
+        na = len(self.act_q)
+        self._hz = np.zeros(na)
+        self._mean = d.qpos[self.act_q].copy()
+        self._amp = np.zeros(na)
+        self._prev_neg = np.zeros(na, bool)
+        self._last_up = np.full(na, -9.0)
+        self._sim_t = 0.0
+        self.target = d.qpos[self.act_q].copy()      # latest commanded angle of every motor (rad)
         # free orbit camera that follows the thorax: drag to rotate, wheel to zoom
         dist = 0.0
         try:
@@ -1128,7 +1205,9 @@ class NeuroMechFlyBody:
             dist = float(np.linalg.norm(m.cam_pos[cid]))
         except Exception:
             pass
-        thorax = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "nmf/c_thorax")
+        thorax = bid("nmf/c_thorax")
+        self.thorax = thorax
+        self.I_yaw = 0.06                           # effective yaw inertia incl. foot friction (measured), for the turning reflex
         pj = [jid("nmf/c_head-c_rostrum-pitch"), jid("nmf/c_rostrum-c_haustellum-pitch")]
         self.prob_adr = np.array([m.jnt_qposadr[i] for i in pj if i >= 0], int)
         self.cam = mj.MjvCamera()
@@ -1141,8 +1220,6 @@ class NeuroMechFlyBody:
 
     def _draw_arena(self):
         """Add walls, obstacles and food to the rendered scene (visual only; collisions are handled in step)."""
-        if self.arena is None:
-            return
         sc, mj = self.renderer.scene, self.mj
         eye = np.eye(3).ravel()
         def add(kind, size, pos, rgba):
@@ -1151,17 +1228,27 @@ class NeuroMechFlyBody:
             mj.mjv_initGeom(sc.geoms[sc.ngeom], kind, np.asarray(size, float), np.asarray(pos, float), eye,
                             np.asarray(rgba, np.float32))
             sc.ngeom += 1
-        hf = self.arena.half
-        wall = (0.55, 0.55, 0.6, 1.0)
-        add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, hf, 0.6], wall)
-        add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, -hf, 0.6], wall)
-        add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [hf, 0, 0.6], wall)
-        add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [-hf, 0, 0.6], wall)
-        for ox, oy, r in self.arena.obstacles:
-            add(mj.mjtGeom.mjGEOM_CYLINDER, [r, 1.6, 0], [ox, oy, 1.6], (0.45, 0.5, 0.62, 1.0))
-        for fx, fy, amt in self.arena.foods:
-            r = 0.25 + 0.45 * max(0.0, min(1.0, amt))
-            add(mj.mjtGeom.mjGEOM_SPHERE, [r, 0, 0], [fx, fy, r], (0.95, 0.55, 0.12, 1.0))
+        if self.arena is not None:
+            hf = self.arena.half
+            wall = (0.55, 0.55, 0.6, 1.0)
+            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, hf, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, -hf, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [hf, 0, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [-hf, 0, 0.6], wall)
+            for ox, oy, r in self.arena.obstacles:
+                add(mj.mjtGeom.mjGEOM_CYLINDER, [r, 1.6, 0], [ox, oy, 1.6], (0.45, 0.5, 0.62, 1.0))
+            for fx, fy, amt in self.arena.foods:
+                r = 0.25 + 0.45 * max(0.0, min(1.0, amt))
+                add(mj.mjtGeom.mjGEOM_SPHERE, [r, 0, 0], [fx, fy, r], (0.95, 0.55, 0.12, 1.0))
+        for p, f in (): # (contact arrows removed)                       # ground-contact force arrows (magenta), like neuromechfly.org
+            L = float(np.linalg.norm(f))
+            if L < 1e-6 or sc.ngeom >= sc.maxgeom:
+                continue
+            tip = p + f / L * min(2.0, L / 5.0)
+            g = sc.geoms[sc.ngeom]
+            mj.mjv_initGeom(g, mj.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3), eye, np.array([0.95, 0.15, 0.85, 1.0], np.float32))
+            mj.mjv_connector(g, mj.mjtGeom.mjGEOM_CAPSULE, 0.04, p, tip)
+            sc.ngeom += 1
 
     # ---------------------------------------------------------------- camera
     def view_reset(self):
@@ -1183,37 +1270,49 @@ class NeuroMechFlyBody:
         self._t_last = 0.0
 
     # ---------------------------------------------------------------- state
-    def reset(self):
+    def reset(self, x=0.0, y=0.0, heading=0.0):
         self.groom = 0.0
         self.feed = 0.0
-        self.x = self.y = 0.0
-        self.heading = 0.0
         self.v = self.w_turn = 0.0
+        self._bv = self._bw = self._vm = self._wm = 0.0
+        self._wf = self._wi = 0.0
         self.phase = 0.0
+        self.gait_hz = 0.0
+        self.x, self.y, self.heading = x, y, heading
         if self.renderer is not None:
-            self.ik.qpos[:] = self.q_neutral
-            self.data.qpos[:] = self.q_neutral
-            self._pose_root()
-            self.mj.mj_forward(self.model, self.data)
-
-    def _pose_root(self):
-        q = self.data.qpos
-        q[0], q[1], q[2] = self.x, self.y, self.root_z
-        q[3], q[4], q[5], q[6] = math.cos(self.heading / 2), 0.0, 0.0, math.sin(self.heading / 2)
+            self._place(x, y, heading)
+    def _place(self, x, y, heading):
+        """Put the fly upright at (x, y) facing `heading`, legs in the neutral pose, at rest."""
+        mj, m, d = self.mj, self.model, self.data
+        mj.mj_resetDataKeyframe(m, d, self.key)
+        d.qpos[:] = self.q_neutral
+        d.qpos[0], d.qpos[1], d.qpos[2] = x, y, self.root_z + 0.02
+        d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6] = math.cos(heading / 2), 0.0, 0.0, math.sin(heading / 2)
+        d.qvel[:] = 0.0
+        self.ik.qpos[:] = self.q_neutral
+        d.ctrl[:] = self.ctrl_neutral
+        for i in self.adh.values():
+            d.ctrl[i] = 1.0
+        self.target = self.q_neutral[self.act_q].copy()
+        for _ in range(int(0.12 / self.PHYS_DT)):
+            mj.mj_step(m, d)
+        self._read_state()
+    def teleport(self, x, y):
+        self.reset(x, y, self.heading)
+    def _read_state(self):
+        d = self.data
+        w, qx, qy, qz = d.qpos[3:7]
+        self.x, self.y = float(d.qpos[0]), float(d.qpos[1])
+        self.heading = math.atan2(2 * (w * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+        self.pitch = math.asin(max(-1.0, min(1.0, 2 * (w * qy - qz * qx))))
+        self.roll = math.atan2(2 * (w * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+        self.upright = 1 - 2 * (qx * qx + qy * qy)
+        self.speed_mm_s = float(math.hypot(d.qvel[0], d.qvel[1]))
 
     # ----------------------------------------------------------------- gait
-    def _foot_offset(self, s, step):
-        """(dx, dz) of the foot relative to its neutral spot; phase s in [0,1), signed step length."""
-        if s < self.STANCE:                                      # foot on the ground, sliding backwards
-            u = s / self.STANCE
-            return step * (0.5 - u), 0.0
-        u = (s - self.STANCE) / (1.0 - self.STANCE)              # swing: lift and move forward
-        lift = self.LIFT * min(1.0, abs(step) / (0.5 * self.STEP_LEN))
-        return step * (-0.5 + 0.5 * (1 - math.cos(math.pi * u))), lift * math.sin(math.pi * u)
-
-    def _solve_leg(self, leg, dx, dz):
+    def _solve_leg(self, leg, dx, dz, dy=0.0):
         mj, m, d = self.mj, self.model, self.ik
-        target = self.tip0[leg] + np.array([dx, 0.0, dz])
+        target = self.tip0[leg] + np.array([dx, dy, dz])
         qa, da = self.qadr[leg], self.dadr[leg]
         q0 = self.q_neutral[qa]
         jac = np.zeros((3, m.nv))
@@ -1228,43 +1327,174 @@ class NeuroMechFlyBody:
             dq = J.T @ np.linalg.solve(J @ J.T + 0.02 * np.eye(3), err)
             d.qpos[qa] = np.clip(d.qpos[qa] + np.clip(dq, -0.25, 0.25), q0 - 1.0, q0 + 1.0)
 
-    def step(self, fwd, back, left, right, dt):
-        if self.renderer is None:
-            return
-        v_t = (fwd - back) * self.V_MAX
-        w_t = (right - left) * self.W_MAX                  # positive = turn right (clockwise)
-        k = min(1.0, dt * 8.0)                             # smooth the commands a little
-        self.v += (v_t - self.v) * k
-        self.w_turn += (w_t - self.w_turn) * k
-        sL = self.v + self.w_turn * self.HALF_TRACK        # left legs speed up when turning right
-        sR = self.v - self.w_turn * self.HALF_TRACK
-        smax = max(abs(sL), abs(sR))
-        if smax > 0.15:
-            f = min(self.F_MAX, self.STANCE * smax / self.STEP_LEN)
-            stepL, stepR = self.STEP_LEN * sL / smax, self.STEP_LEN * sR / smax
-            self.phase = (self.phase + f * dt) % 1.0
-        else:
-            stepL = stepR = 0.0                            # standing: legs settle back to the neutral pose
-        self.heading -= self.w_turn * dt
-        self.x += self.v * math.cos(self.heading) * dt
-        self.y += self.v * math.sin(self.heading) * dt
-        if self.arena is not None:
-            self.x, self.y = self.arena.resolve(self.x, self.y)
-        gr = float(min(1.0, max(0.0, self.groom)))
-        self._groom_t += dt
+    def _track_hz(self, q, dt):
+        """Vectorised zero-crossing frequency estimate of every motor angle."""
+        self._sim_t += dt
+        a = min(1.0, dt / 0.5)
+        self._mean += a * (q - self._mean)
+        s = q - self._mean
+        self._amp += min(1.0, dt / 0.15) * (np.abs(s) - self._amp)
+        neg = s < 0
+        up = self._prev_neg & ~neg
+        if up.any():
+            per = self._sim_t - self._last_up[up]
+            ok = (per > 0.03) & (per < 1.5)
+            hz = np.where(ok, 1.0 / np.maximum(per, 1e-6), 0.0)
+            idx = np.flatnonzero(up)
+            self._hz[idx] = np.where(self._hz[idx] > 0, 0.6 * self._hz[idx] + 0.4 * hz, hz)
+            self._last_up[up] = self._sim_t
+        self._prev_neg = neg
+        stale = (self._sim_t - self._last_up > 0.7) | (self._amp < 0.02)
+        self._hz[stale] = 0.0
+
+    def _contacts(self):
+        mj, m, d = self.mj, self.model, self.data
+        f6 = np.zeros(6)
+        draw, f = [], np.zeros(6)
+        n = 0
+        for i in range(d.ncon):
+            c = d.contact[i]
+            b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+            leg = self.body_leg[b2] if b1 == 0 else (self.body_leg[b1] if b2 == 0 else -1)
+            if leg < 0 and not (b1 == 0 or b2 == 0):
+                continue
+            mj.mj_contactForce(m, d, i, f)
+            fn = float(f[0])
+            n += 1
+            if leg >= 0:
+                f6[leg] += fn
+            fw = c.frame[:3] * fn                          # normal force, world frame (points from geom1 to geom2)
+            if b2 == 0:
+                fw = -fw
+            draw.append((np.array(c.pos), fw))
+        self.leg_force, self.n_contacts, self.contact_draw = f6, n, draw
+
+    def _apply_gait(self, vs, f, scale, gr):
+        """Joint targets (inverse kinematics) + adhesion for the current gait phase -> motor commands."""
+        d = self.data
         for leg in self.LEGS:
             s = (self.phase + self.TRIPOD[leg]) % 1.0
-            dx, dz = self._foot_offset(s, (stepL if leg[0] == "l" else stepR) * (1.0 - gr))
+            dx = dy = dz = 0.0
+            if f > 0:
+                S = vs[leg] * (self.STANCE / f) * scale * (1.0 - gr)
+                n = float(np.linalg.norm(S))
+                if n > self.STEPMAX:
+                    S = S * (self.STEPMAX / n)
+                    n = self.STEPMAX
+                if s < self.STANCE:                        # foot on the ground, sliding backwards under the body
+                    kk, dz = 0.5 - s / self.STANCE, -self.PRESS
+                else:                                      # swing: lift and carry forward
+                    u = (s - self.STANCE) / (1.0 - self.STANCE)
+                    kk = -0.5 + 0.5 * (1 - math.cos(math.pi * u))
+                    dz = self.LIFT * (self.HIND_LIFT if leg in ('lh', 'rh') else 1.0) * math.sin(math.pi * u) * min(1.0, n / (0.5 * self.STEPMAX))
+                dx, dy = S[0] * kk, S[1] * kk
             if gr > 0.02 and leg in ("lf", "rf"):          # front legs lift and rub in front of the head
                 ph = 2 * math.pi * 6.0 * self._groom_t + (0.0 if leg == "lf" else math.pi)
                 dx = (1 - gr) * dx + gr * (0.9 + 0.3 * math.sin(ph))
                 dz = (1 - gr) * dz + gr * (0.9 + 0.25 * math.cos(ph))
-            self._solve_leg(leg, dx, dz)
+                dy = (1 - gr) * dy
+            self._solve_leg(leg, dx, dz, dy)
+            if leg in self.adh:
+                swing = f > 0 and s >= self.STANCE
+                d.ctrl[self.adh[leg]] = 0.0 if (swing or (gr > 0.5 and leg in ("lf", "rf"))) else 1.0
         if self.prob_adr.size:
             self.ik.qpos[self.prob_adr] = self.FEED_ANGLES[: self.prob_adr.size] * float(min(1.0, max(0.0, self.feed)))
-        self.data.qpos[:] = self.ik.qpos
-        self._pose_root()
-        self.mj.mj_forward(self.model, self.data)
+        self.target = self.ik.qpos[self.act_q].copy()
+        d.ctrl[self.pos_act] = self.target
+
+    def step(self, fwd, back, left, right, dt):
+        if self.renderer is None:
+            return
+        mj, m, d = self.mj, self.model, self.data
+        wall0 = time.perf_counter()
+        dt = max(1e-3, min(dt, 0.06))
+        v_t = (fwd - back) * self.V_MAX
+        w_t = -(right - left) * self.W_MAX                 # counter-clockwise = positive; right drive turns clockwise
+        k = min(1.0, dt * 8.0)                             # smooth the commands a little
+        # Spinal-cord-like feedback: the feet slip, so measure how fast the body really moves / turns (proprioception +
+        # a gyro-like signal) and trim the gait command until it matches what the brain asked for.
+        c_h, s_h = math.cos(self.heading), math.sin(self.heading)
+        v_meas = float(d.qvel[0] * c_h + d.qvel[1] * s_h)
+        w_meas = float(d.qvel[5])
+        a_m = min(1.0, dt / 0.2)
+        self._vm += a_m * (v_meas - self._vm)
+        self._wm += a_m * (w_meas - self._wm)
+        if abs(v_t) < 0.5 and abs(w_t) < 0.05:
+            self._bv = self._bw = 0.0                      # told to stand still: no trim
+        else:
+            self._bv = float(np.clip(self._bv + self.K_V * (v_t * self.EFF_V - self._vm) * dt, -self.V_MAX, self.V_MAX))
+            self._bw = float(np.clip(self._bw + self.K_W * (w_t * self.EFF_W - self._wm) * dt, -self.BIAS_W, self.BIAS_W))
+        self.v += ((v_t + self._bv) - self.v) * k
+        self.w_turn += ((w_t + self._bw) - self.w_turn) * k
+        vs = {}
+        for leg in self.LEGS:
+            rx, ry = self.tip0[leg][0], self.tip0[leg][1]
+            vs[leg] = np.array([self.v - self.w_turn * ry, self.w_turn * rx])   # where this foot's patch of ground has to slide
+        smax = max(float(np.linalg.norm(x)) for x in vs.values())
+        gr = float(min(1.0, max(0.0, self.groom)))
+        if smax > 0.4:
+            f_need = self.STANCE * smax / self.STEPMAX
+            f = min(self.F_MAX, max(self.F_MIN, f_need))
+            scale = min(1.0, f / f_need)
+        else:
+            f, scale = 0.0, 0.0                            # standing: legs settle back to the neutral pose
+        self.gait_hz = f
+        self._w_des = w_t * self.TURN_RATE
+        # --- real physics: the gait targets are refreshed every few milliseconds, MuJoCo steps in between;
+        #     the feet push on the ground and that is what moves / turns the body --------------------------------
+        n = int(min(220, max(1, round(dt / self.PHYS_DT))))
+        chunk = 12
+        done = 0
+        while done < n:
+            c = min(chunk, n - done)
+            cdt = c * self.PHYS_DT
+            self.phase = (self.phase + f * cdt) % 1.0
+            self._groom_t += cdt
+            self._apply_gait(vs, f, scale, gr)
+            if self.YAW_ASSIST > 0.0 and self.upright > 0.5:   # gyro-like turning reflex (PI on the yaw rate)
+                self._wf += min(1.0, cdt / 0.05) * (float(d.qvel[5]) - self._wf)
+                err = self._w_des - self._wf
+                self._wi = float(np.clip(self._wi + err * cdt, -self.YAW_IMAX, self.YAW_IMAX))
+                tq = self.YAW_ASSIST * (self.YAW_KP * err + self.YAW_KI * self._wi)
+                d.xfrc_applied[self.thorax, 5] = float(np.clip(tq, -self.YAW_TMAX, self.YAW_TMAX))
+            for _ in range(c):
+                mj.mj_step(m, d)
+            done += c
+            self._track_hz(d.qpos[self.act_q], cdt)
+        self._contacts()
+        self._read_state()
+        if not np.isfinite(d.qpos).all() or self.upright < 0.35 or d.qpos[2] < 0.1 or d.qpos[2] > 6.0:
+            self._place(self.x if np.isfinite(self.x) else 0.0, self.y if np.isfinite(self.y) else 0.0,
+                        self.heading if np.isfinite(self.heading) else 0.0)   # fell over / blew up: stand it back up
+        if self.arena is not None:
+            nx, ny = self.arena.resolve(self.x, self.y)
+            if abs(nx - self.x) > 1e-9 or abs(ny - self.y) > 1e-9:    # the wall / an obstacle is solid
+                d.qpos[0], d.qpos[1] = nx, ny
+                d.qvel[0] = d.qvel[1] = 0.0
+                self.x, self.y = nx, ny
+        wall = max(1e-4, time.perf_counter() - wall0)
+        self.rt_factor += 0.1 * (n * self.PHYS_DT / wall - self.rt_factor)
+
+    # ------------------------------------------------------------ read-outs
+    def motor_table(self):
+        """Per-leg motor read-out for the Motor Properties page: [(group title, [(label, target, actual, torque, Hz, neutral angle)])]."""
+        d = self.data
+        actual = d.qpos[self.act_q]
+        force = d.actuator_force[self.pos_act]
+        groups = {}
+        for i, (leg, label) in enumerate(self.act_info):
+            hz = float(self._hz[i])
+            if self.gait_hz > 0.5 and hz > 1.6 * self.gait_hz:
+                hz *= 0.5                                  # a joint that crosses zero twice per step: count whole cycles
+            groups.setdefault(leg, []).append((label, float(self.target[i]), float(actual[i]), float(force[i]), hz,
+                                               float(self.q_neutral[self.act_q[i]])))
+        out = []
+        for leg in self.LEGS:
+            if leg in groups:
+                out.append((leg, self.LEG_NAMES[leg], groups[leg]))
+        if "head" in groups:
+            out.append(("head", "Head / proboscis", groups["head"]))
+        return out
 
     # --------------------------------------------------------------- render
     def render(self, w, h):
@@ -1411,6 +1641,10 @@ class FlyControllerApp:
         self.nb.add(tab_ctrl, text="   Control Panel   ")
         self.nb.add(tab_build, text="   Build (obstacles & food)   ")
         self.nb.add(tab_setup, text="   MaleCNS Setup   ")
+        tab_motor = ttk.Frame(self.nb)
+        self.nb.add(tab_motor, text="   Motor Properties   ")
+        self.tab_motor = tab_motor
+        self.build_motors(tab_motor)
         tab_min = ttk.Frame(self.nb)
         self.nb.add(tab_min, text="   Minimize   ")
         self.build_minimized(tab_min)
@@ -1514,7 +1748,7 @@ class FlyControllerApp:
         # The real NeuroMechFly model (FlyGym meshes), walking; no hand-drawn stand-in.
         self.body = NeuroMechFlyBody(VIEW_W, VIEW_H)
         self.tool = tk.StringVar(value="rotate")
-        self.gain_var = tk.DoubleVar(value=1.5)
+        self.gain_var = tk.DoubleVar(value=1.0)
         self.rate_var = tk.DoubleVar(value=100.0)
         self.brush_var = tk.DoubleVar(value=22.0)
         self.net_note = tk.StringVar(value="")
@@ -1597,7 +1831,6 @@ class FlyControllerApp:
             self.sim.stop()
         self.net = net
         self.up_pool = self.build_up_pools(net)
-        self.cut_pool_to_dn(net, self.up_pool)
         self.stim_mask = np.zeros(net.n, bool)
         self._proj = (np.zeros(net.n),) * 3
         self.region_cols = REGION_COLORS[net.labels]
@@ -1990,9 +2223,20 @@ class FlyControllerApp:
         painted = np.flatnonzero(self.stim_mask)
         if painted.size:
             glow(simidx, self.stim_mask.astype(np.float32), MINT_BGR, 2.5)
-        hot = np.flatnonzero(self.sim.flash > 0.05)
+        act = np.minimum(self.sim.act, 1.0)
+        if act.max() > 0.02:
+            glow(simidx, act, FIRE_BGR, 2.6, sigma=1.6)                    # slow glow: where the network has been active lately
+        hot = np.flatnonzero(self.sim.flash > 0.5)
         if hot.size:
-            glow(simidx, self.sim.flash, FIRE_BGR, 3.0, sigma=max(1.3, blur * 1.6))   # firing neurons get a wider halo so activity is easy to see
+            glow(simidx, (self.sim.flash > 0.5).astype(np.float32), (255, 255, 255), 0.8, sigma=0.7)   # white flecks: spikes right now
+        if self.sim.running:                                               # the command pathway: sensory/upstream pool -> descending neurons
+            for g in GROUPS:                                               # coloured by the direction it commands
+                pool = self.up_pool.get(g)
+                if pool is not None and pool.size:
+                    wv = np.zeros(n, np.float32)
+                    wv[pool] = act[pool]
+                    if wv.max() > 0.05:
+                        glow(simidx, wv, GROUP_COLORS[g], 9.0, sigma=2.4)
         img = img.clip(0, 255).astype(np.uint8)
         if self.show_skel.get() and len(net.skel_edges):
             S = net.skel_pos
@@ -2008,11 +2252,15 @@ class FlyControllerApp:
                 if sel.any():
                     cv2.polylines(img, list(segs[sel]), False,
                                   GROUP_COLORS[GROUPS[gi]] if gi < 4 else (235, 235, 235), 1, cv2.LINE_AA)
-        for g in GROUPS:                                   # DN groups: small always-visible markers
+        drives = dict(zip(GROUPS, self.sim.drives(DRIVE_FULL_HZ)))
+        for g in GROUPS:                                   # DN groups: markers that swell with their firing rate (= what the motors get)
             idx = net.groups[g]
             idx = idx[ok[idx]]
+            r = 2 + int(round(3 * drives[g]))
             for px, py in zip(ix[idx], iy[idx]):
-                cv2.circle(img, (int(px), int(py)), 2, GROUP_COLORS[g], -1, cv2.LINE_AA)
+                cv2.circle(img, (int(px), int(py)), r, GROUP_COLORS[g], -1, cv2.LINE_AA)
+                if drives[g] > 0.15:
+                    cv2.circle(img, (int(px), int(py)), r + 1, (255, 255, 255), 1, cv2.LINE_AA)
         if self.mouse is not None and self.tool.get() != "rotate":
             cv2.circle(img, (int(self.mouse[0]), int(self.mouse[1])), int(self.brush_var.get()), (220, 220, 220), 1, cv2.LINE_AA)
         return img
@@ -2063,8 +2311,11 @@ class FlyControllerApp:
                     self._escape_t -= dt
                     lvl, bk, lt, rt = 0.85, 0.0, max(0.0, self._escape_turn), max(0.0, -self._escape_turn)
                 for key, val in (("fwd", lvl), ("back", bk), ("left", lt), ("right", rt)):
-                    ext[self.net.groups[key]] = ENV_RATE_HZ * val
+                    # the command enters the network through the upstream (premotor) pool and reaches the descending neurons
+                    # through the real synapses; only 'back' also gets a direct push because its pool barely reaches its DNs
                     ext[self.up_pool[key]] = np.maximum(ext[self.up_pool[key]], UP_RATE_HZ * val / max(0.5, self.sim.gain) ** UP_GAIN_POW)
+                    if key == "back":
+                        ext[self.net.groups[key]] = ENV_RATE_HZ * val
             elif mode != BASE_LABEL:                       # a BadApple-fly movement program: stimulate its neurons
                 sides = {"Both": ("L", "R"), "Left": ("L",), "Right": ("R",)}[self.side_var.get()]
                 for sd in sides:
@@ -2108,6 +2359,14 @@ class FlyControllerApp:
                           self.last_motion[0], self.last_motion[1]))
         if self.graph_win is not None and self.frame_i % 2 == 0:
             self.draw_graphs()
+        if self.frame_i % 4 == 0:
+            try:
+                if self.nb.select() == str(self.tab_motor):         # only draw it while the page is open
+                    self.draw_motors()
+            except Exception as err:
+                if not getattr(self, "_motor_err", False):
+                    self._motor_err = True
+                    print("[!] Motor Properties page:", err)
         self.root.after(33, self.update_lab)
     # ------------------------------------------------------------------
     # BUILD TAB: place obstacles and food for the fly
@@ -2223,7 +2482,8 @@ class FlyControllerApp:
         elif tool == "food":
             self.arena.add_food(x, y)
         elif tool == "fly":
-            self.body.x, self.body.y = self.arena.resolve(x, y)
+            rx, ry = self.arena.resolve(x, y)
+            self.body.teleport(rx, ry)
             self.trail = []
     def update_arena_view(self):
         cv = self.arena_canvas
@@ -2411,6 +2671,137 @@ class FlyControllerApp:
             self.game_combo.config(state="disabled")
             self.map_btn.state(["disabled"])
             self.add_mode_btn.state(["disabled"])
+    # ------------------------------------------------------------------
+    # MOTOR PROPERTIES TAB: every joint motor of the fly (target vs. actual angle, step rate) + ground contact forces
+    # ------------------------------------------------------------------
+    def build_motors(self, parent):
+        self.motor_canvas = tk.Canvas(parent, width=900, height=520, highlightthickness=0, bd=0, bg="#f0f0f0")
+        self.motor_canvas.pack(fill=tk.BOTH, expand=True)
+        self.motor_label = tk.Label(self.motor_canvas, bd=0, bg="#f0f0f0")
+        self.motor_canvas.create_window(0, 0, window=self.motor_label, anchor="nw")
+        def wheel(e):
+            self.motor_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        for w in (self.motor_canvas, self.motor_label):
+            w.bind("<MouseWheel>", wheel)
+    @staticmethod
+    def _deg_text(img, val, x, y, color, scale=0.4):
+        t = f"{val:+.1f}"
+        cv2.putText(img, t, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        cv2.circle(img, (x + tw + 3, y - int(7 * scale / 0.4)), 2, color, 1, cv2.LINE_AA)            # the degree sign
+    def render_motors(self, W=MOTOR_W, H=900):
+        """Windows-style light panel: a group box per leg that fills the page, a slider-like bar per joint motor."""
+        body = self.body
+        bg, edge, zebra = (240, 240, 240), (205, 205, 205), (232, 232, 232)
+        ink, dim = (20, 20, 20), (95, 95, 95)
+        blue, lblue, green, groove = (215, 120, 0), (240, 205, 150), (60, 160, 40), (200, 200, 200)
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        if body.renderer is None:
+            img = np.full((H, W, 3), bg, np.uint8)
+            cv2.putText(img, "NeuroMechFly unavailable - no motors to show", (20, 60), F, 0.6, ink, 1, cv2.LINE_AA)
+            return img
+        tab = body.motor_table()
+        byid = {g: (name, rows) for g, name, rows in tab}
+        order = [g for g in ("lf", "lm", "lh", "rf", "rm", "rh") if g in byid]
+        ncol = 4 if W >= 1500 else (3 if W >= 1050 else 2)
+        if ncol == 4:
+            items = ["lf", "lm", "lh", "head", "rf", "rm", "rh", "contact"]
+        else:
+            items = order[:3] + (["head"] if "head" in byid else []) + order[3:] + ["contact"]
+            items = [it for it in items if it in byid or it == "contact"]
+            if ncol == 2:
+                items = [x for pair in zip(order[:3], order[3:]) for x in pair] + [i for i in ("head", "contact") if i == "contact" or "head" in byid]
+        items = [it for it in items if it in byid or it == "contact"]
+        nrows_of = lambda it: 6 if it == "contact" else len(byid[it][1])
+        grid = [items[i:i + ncol] for i in range(0, len(items), ncol)]
+        PAD, TOP = 12, 66
+        units = sum(max(nrows_of(i) for i in r) + 2.0 for r in grid)
+        ROW = max(15.0, min(34.0, (H - TOP - PAD * (len(grid) + 1)) / units))
+        sc = max(0.8, min(1.5, ROW / 22.0))
+        BW = (W - PAD * (ncol + 1)) // ncol
+        need = int(TOP + sum((max(nrows_of(i) for i in r) + 2.0) * ROW + PAD for r in grid) + PAD)
+        img = np.full((max(H, need), W, 3), bg, np.uint8)
+        d = body.data
+        cv2.putText(img, "Motor properties", (PAD, 24), F, 0.7, ink, 1, cv2.LINE_AA)
+        l1 = (f"speed {body.speed_mm_s:4.1f} mm/s    heading {math.degrees(body.heading) % 360:5.1f}    pitch {math.degrees(body.pitch):+5.1f}"
+              f"    roll {math.degrees(body.roll):+5.1f}    height {float(d.qpos[2]):.2f} mm")
+        l2 = (f"{body.n_contacts} ground contacts    step rate {body.gait_hz:4.1f} Hz    physics {body.rt_factor:3.1f}x real time"
+              f"    ground force {float(body.leg_force.sum()):4.1f} uN (fly weighs about 10 uN)")
+        cv2.putText(img, l1, (PAD, 66 - 24), F, 0.45, dim, 1, cv2.LINE_AA)
+        cv2.putText(img, l2, (PAD, 66 - 8), F, 0.45, dim, 1, cv2.LINE_AA)
+        lx = W - 330
+        cv2.rectangle(img, (lx, 12), (lx + 8, 28), blue, -1)
+        cv2.putText(img, "target (command)", (lx + 14, 26), F, 0.4, dim, 1, cv2.LINE_AA)
+        cv2.fillPoly(img, [np.array([[lx + 160, 14], [lx + 170, 14], [lx + 165, 24]], np.int32)], green, cv2.LINE_AA)
+        cv2.putText(img, "actual angle", (lx + 176, 26), F, 0.4, dim, 1, cv2.LINE_AA)
+        FMAX = 8.0
+        leg_col = {"lf": (200, 110, 150), "lm": (205, 130, 90), "lh": (110, 170, 215),
+                   "rf": (80, 160, 235), "rm": (95, 200, 140), "rh": (205, 190, 80), "head": (150, 150, 150)}
+        def group(x0, y0, h, title):
+            cv2.rectangle(img, (x0, y0 + 9), (x0 + BW, y0 + h), edge, 1)
+            (tw, _), _ = cv2.getTextSize(title, F, 0.5 * sc ** 0.5, 1)
+            cv2.rectangle(img, (x0 + 8, y0), (x0 + 20 + tw, y0 + 18), bg, -1)
+            cv2.putText(img, title, (x0 + 14, y0 + 14), F, 0.5 * sc ** 0.5, ink, 1, cv2.LINE_AA)
+        fs = min(0.38 * sc, 0.29 * BW / 265.0)          # keep the longest label clear of the bars
+        SPAN = math.radians(100.0)
+        y = TOP
+        for r in grid:
+            nr = max(nrows_of(i) for i in r)
+            h = int((nr + 2.0) * ROW)
+            for ci, it in enumerate(r):
+                x0 = PAD + ci * (BW + PAD)
+                if it == "contact":
+                    group(x0, y, h, "Foot contact + adhesion pads")
+                    for i, leg in enumerate(body.LEGS):
+                        cy = int(y + 1.6 * ROW + i * ROW + ROW / 2)
+                        fz = float(body.leg_force[i])
+                        grip = float(d.ctrl[body.adh[leg]]) if leg in body.adh else 0.0
+                        cv2.rectangle(img, (x0 + 12, cy - 5), (x0 + 22, cy + 5), leg_col[leg], -1)
+                        cv2.putText(img, body.LEG_NAMES[leg], (x0 + 30, cy + 4), F, fs, dim, 1, cv2.LINE_AA)
+                        t0, t1 = x0 + int(BW * 0.34), x0 + int(BW * 0.70)
+                        cv2.rectangle(img, (t0, cy - 3), (t1, cy + 3), groove, -1)
+                        cv2.rectangle(img, (t0, cy - 3), (t0 + int((t1 - t0) * min(1.0, fz / FMAX)), cy + 3), (200, 60, 220), -1)
+                        cv2.putText(img, f"{fz:4.1f} uN", (x0 + int(BW * 0.72), cy + 4), F, fs, ink, 1, cv2.LINE_AA)
+                        cv2.putText(img, "grip" if grip > 0.5 else "free", (x0 + int(BW * 0.88), cy + 4), F, fs,
+                                    green if grip > 0.5 else (140, 140, 140), 1, cv2.LINE_AA)
+                    continue
+                name, rows = byid[it]
+                group(x0, y, h, f"{name} ({len(rows)})")
+                if it in body.LEGS:
+                    fz = float(body.leg_force[body.LEGS.index(it)])
+                    bx = x0 + BW - 120
+                    cv2.putText(img, f"foot {fz:4.1f} uN", (bx - 70, y + 15), F, 0.38, dim, 1, cv2.LINE_AA)
+                    cv2.rectangle(img, (bx + 20, y + 8), (bx + 108, y + 13), groove, -1)
+                    cv2.rectangle(img, (bx + 20, y + 8), (bx + 20 + int(88 * min(1.0, fz / FMAX)), y + 13), (200, 60, 220), -1)
+                tx0, tx1 = x0 + int(BW * 0.34), x0 + int(BW * 0.70)
+                for i, (label, tgt, act, tq, hz, neu) in enumerate(rows):
+                    top = int(y + 1.6 * ROW + i * ROW)
+                    cy = int(top + ROW / 2)
+                    if i % 2 == 0:
+                        cv2.rectangle(img, (x0 + 4, top), (x0 + BW - 4, int(top + ROW)), zebra, -1)
+                    cv2.putText(img, label, (x0 + 10, cy + 4), F, fs, ink, 1, cv2.LINE_AA)
+                    f = lambda a: int(tx0 + (tx1 - tx0) * (min(SPAN, max(-SPAN, a - neu)) + SPAN) / (2 * SPAN))
+                    cv2.line(img, (tx0, cy), (tx1, cy), groove, 3, cv2.LINE_AA)
+                    cv2.line(img, (f(neu), cy), (f(act), cy), lblue, 3, cv2.LINE_AA)
+                    cv2.line(img, (f(neu), cy - 4), (f(neu), cy + 4), (150, 150, 150), 1)
+                    tg = f(tgt)
+                    cv2.rectangle(img, (tg - 3, cy - 7), (tg + 3, cy + 7), blue, -1)
+                    ax = f(act)
+                    cv2.fillPoly(img, [np.array([[ax - 4, cy - 10], [ax + 4, cy - 10], [ax, cy - 4]], np.int32)], green, cv2.LINE_AA)
+                    self._deg_text(img, math.degrees(act), x0 + int(BW * 0.73), cy + 4, ink, fs)
+                    hzt = f"{hz:4.1f} Hz" if hz > 0.05 else "- Hz"
+                    cv2.putText(img, hzt, (x0 + int(BW * 0.88), cy + 4), F, fs, dim if hz < 0.05 else blue, 1, cv2.LINE_AA)
+            y += h + PAD
+        return img
+    def draw_motors(self):
+        W = max(700, self.motor_canvas.winfo_width() - 2)
+        H = max(420, self.motor_canvas.winfo_height() - 2)
+        img = self.render_motors(W, H)
+        self.set_image(self.motor_label, img)
+        try:
+            self.motor_canvas.configure(scrollregion=(0, 0, img.shape[1], img.shape[0]))
+        except tk.TclError:
+            pass
     def build_minimized(self, parent):
         """4th page: a tiny 'parked' state. Selecting it shrinks the whole window; any other tab restores it."""
         try:
