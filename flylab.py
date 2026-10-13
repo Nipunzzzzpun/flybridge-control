@@ -2304,6 +2304,38 @@ class FlyControllerApp:
         scale = ttk.Scale(row, from_=lo, to=hi, variable=var, orient=tk.HORIZONTAL, command=changed)
         scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         return scale
+    def make_dial(self, parent, var, size=112):
+        """Windows-style circular dial (angle 0-359 deg): light-blue track, blue arc up to the value, round knob with a soft halo and the angle in the middle.
+        Drag it, click on the ring, or use the mouse wheel (5 deg per notch). 0 deg = east (same as the wind compass), turning counter-clockwise."""
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        cv = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        c0, R = size / 2.0, size / 2.0 - 17
+        accent, track, halo = "#0067c0", "#cfe0f5", "#c4daf3"
+        def draw(*_a):
+            try:
+                d = float(var.get()) % 360.0
+            except Exception:
+                d = 0.0
+            cv.delete("all")
+            cv.create_oval(c0 - R, c0 - R, c0 + R, c0 + R, outline=track, width=5)
+            if d > 0.5:
+                cv.create_arc(c0 - R, c0 - R, c0 + R, c0 + R, start=0, extent=d, style="arc", outline=accent, width=5)
+            a = math.radians(d)
+            kx, ky = c0 + R * math.cos(a), c0 - R * math.sin(a)
+            cv.create_oval(kx - 14, ky - 14, kx + 14, ky + 14, fill=halo, outline="")
+            cv.create_oval(kx - 8, ky - 8, kx + 8, ky + 8, fill="#ffffff", outline=accent, width=4)
+            cv.create_text(c0, c0, text=f"{d:.0f}\u00b0", font=("Segoe UI", 12, "bold"), fill="#1b1b1b")
+        def drag(e):
+            deg = math.degrees(math.atan2(c0 - e.y, e.x - c0)) % 360.0
+            var.set(float(round(deg)) % 360.0)
+        def wheel(e):
+            var.set((float(var.get()) + (5.0 if e.delta > 0 else -5.0)) % 360.0)
+        cv.bind("<Button-1>", drag)
+        cv.bind("<B1-Motion>", drag)
+        cv.bind("<MouseWheel>", wheel)
+        var.trace_add("write", draw)
+        draw()
+        return cv
     def clear_keylog(self):
         self.key_text.configure(state="normal")
         self.key_text.delete("1.0", "end")
@@ -2817,7 +2849,10 @@ class FlyControllerApp:
         self.wind_speed_var = tk.DoubleVar(value=8.0)
         self.wind_dir_var = tk.DoubleVar(value=0.0)
         self.make_slider(side, "Wind speed (mm/s)", self.wind_speed_var, 0.0, 25.0, "{:.0f}", label_w=17)
-        self.make_slider(side, "Wind direction (deg)", self.wind_dir_var, 0.0, 359.0, "{:.0f}", label_w=17)
+        drow = ttk.Frame(side)
+        drow.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(drow, text="Wind direction", width=17).pack(side=tk.LEFT, anchor=tk.N, pady=(6, 0))
+        self.make_dial(drow, self.wind_dir_var).pack(side=tk.RIGHT)
         self.smell_var = tk.DoubleVar(value=self.arena.smell_range)      # (no slider any more: the old radius mode keeps its default reach)
         ttk.Button(side, text="Refill food", command=self.arena.refill).pack(fill=tk.X, pady=(12, 2))
         ttk.Button(side, text="Reset fly", command=self.reset_fly).pack(fill=tk.X, pady=2)
