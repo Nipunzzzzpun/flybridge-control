@@ -3971,8 +3971,7 @@ class FlyControllerApp:
         row = ttk.Frame(b)
         row.pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(row, text="Apply profile", command=self.apply_profile).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(row, text="Reset ALL settings", command=lambda: self.reset_settings(), bg="#c42b1c", fg="#ffffff", activebackground="#a52215",
-                  activeforeground="#ffffff", relief=tk.FLAT, bd=0, highlightthickness=0, cursor="hand2", font=("Segoe UI", 9), padx=10, pady=3).pack(side=tk.LEFT)
+        self.red_button(row, "Reset ALL settings", lambda: self.reset_settings()).pack(side=tk.LEFT)
         ttk.Label(b, text="Settings are saved automatically to flylab_settings.json and loaded next time.", foreground="#555555",
                   wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         # --- Advanced
@@ -4018,6 +4017,43 @@ class FlyControllerApp:
         sbar.bind("<B1-Motion>", lambda _e: sync())
         sbar.bind("<ButtonRelease-1>", lambda _e: sync())
         lb.selection_set(0)
+    def red_button(self, parent, text, command):
+        """A red, white-text button that has exactly the size, font and rounded corners of the neighbouring ttk buttons (native ttk buttons can't be recoloured)."""
+        import tkinter.font as tkfont
+        font = tkfont.nametofont("TkDefaultFont")
+        w, h = font.measure(text) + 26, 26
+        try:                                                      # measure a real ttk button so the size matches to the pixel
+            ref = ttk.Button(parent, text=text)
+            ref.update_idletasks()
+            w, h = max(w, int(ref.winfo_reqwidth())), max(h, int(ref.winfo_reqheight()))
+            ref.destroy()
+        except Exception:
+            pass
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        cv = tk.Canvas(parent, width=w, height=h, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        state = {"over": False, "down": False}
+        def draw():
+            cv.delete("all")
+            fill = "#a52215" if state["down"] else ("#b82819" if state["over"] else "#c42b1c")
+            x0, y0, x1, y1, r = 1, 1, w - 1, h - 1, 4
+            cv.create_polygon(x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
+                              smooth=True, fill=fill, outline="#8f1c11")
+            cv.create_text(w / 2.0, h / 2.0, text=text, fill="#ffffff", font=font)
+        def press(_e):
+            state["down"] = True
+            draw()
+        def release(e):
+            was = state["down"]
+            state["down"] = False
+            draw()
+            if was and 0 <= e.x <= w and 0 <= e.y <= h:
+                command()
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<ButtonRelease-1>", release)
+        cv.bind("<Enter>", lambda _e: (state.__setitem__("over", True), draw()))
+        cv.bind("<Leave>", lambda _e: (state.__setitem__("over", False), draw()))
+        draw()
+        return cv
     def _here(self, name):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
     def save_layout(self):
