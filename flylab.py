@@ -447,7 +447,7 @@ class Plume:
         self.pos = np.zeros((0, 2))
         self.vt = np.zeros((0, 2))                         # per-puff turbulent velocity
         self.age = np.zeros(0)
-    def update(self, dt, foods, speed, direction_deg, turb=0.8):
+    def update(self, dt, foods, speed, direction_deg, turb=0.8, obstacles=()):
         dt = min(dt, 0.1)
         self.t += dt
         base = math.radians(direction_deg)
@@ -466,8 +466,33 @@ class Plume:
             u_perp *= speed * turb * (0.4 + 0.6 * np.minimum(1.0, self.age / 3.0))
             tau = 0.7
             self.vt += -self.vt * dt / tau + math.sqrt(2 * dt / tau) * 0.12 * speed * turb * self.rng.normal(size=self.vt.shape)
-            self.pos[:, 0] += (wx * speed + nx * u_perp + self.vt[:, 0]) * dt
-            self.pos[:, 1] += (wy * speed + ny * u_perp + self.vt[:, 1]) * dt
+            dvx = np.zeros_like(sa)
+            dvy = np.zeros_like(sa)
+            Ux, Uy = wx * speed, wy * speed
+            for ox, oy, a in obstacles:                    # wind flows AROUND each obstacle (potential flow past a cylinder)
+                rx, ry = x - ox, y - oy
+                rho2 = np.maximum(rx * rx + ry * ry, a * a)
+                near = rho2 < (6.0 * a) ** 2
+                if not near.any():
+                    continue
+                k = a * a / rho2
+                dot = (Ux * rx + Uy * ry) / rho2             # U . rho_hat / rho
+                dvx += np.where(near, k * (Ux - 2.0 * dot * rx), 0.0)
+                dvy += np.where(near, k * (Uy - 2.0 * dot * ry), 0.0)
+            self.pos[:, 0] += (wx * speed + nx * u_perp + self.vt[:, 0] + dvx) * dt
+            self.pos[:, 1] += (wy * speed + ny * u_perp + self.vt[:, 1] + dvy) * dt
+            for ox, oy, a in obstacles:                    # smoke cannot enter an obstacle: slide it back out to the surface
+                rx, ry = self.pos[:, 0] - ox, self.pos[:, 1] - oy
+                rho = np.hypot(rx, ry)
+                inside = rho < a * 1.03
+                if inside.any():
+                    rho_i = np.maximum(rho[inside], 1e-6)
+                    self.pos[inside, 0] = ox + rx[inside] / rho_i * a * 1.03
+                    self.pos[inside, 1] = oy + ry[inside] / rho_i * a * 1.03
+                    nxr, nyr = rx[inside] / rho_i, ry[inside] / rho_i
+                    vin = np.minimum(self.vt[inside, 0] * nxr + self.vt[inside, 1] * nyr, 0.0)
+                    self.vt[inside, 0] -= vin * nxr
+                    self.vt[inside, 1] -= vin * nyr
             self.age += dt
             h = self.half + 6.0
             keep = (self.age < self.LIFE) & (np.abs(self.pos[:, 0]) < h) & (np.abs(self.pos[:, 1]) < h)
@@ -1089,7 +1114,7 @@ BLOOKET_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fly
 MAP_STEPS = [("1", "ANSWER 1"), ("2", "ANSWER 2"), ("3", "ANSWER 3"), ("4", "ANSWER 4"), ("continue", "the CONTINUE / SUBMIT button")]
 EYE_PX, EYE_FOV, EYE_YAW = 120, 110.0, 35.0                  # eye camera resolution (px), field of view (deg), outward turn of each eye (deg)
 MOTOR_W = 860                                             # width of the Motor Properties picture
-MINI_W, MINI_H = 790, 320                                  # window size on the "Minimized" page
+MINI_W, MINI_H = 980, 320                                  # window size on the "Minimized" page
 FOOD_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_food_key.json")
 def load_food_key():
     try:
@@ -1145,6 +1170,36 @@ STILL_THRESHOLD = 0.08  # motion below this (same trigger as walking) counts as 
 DEFAULT_WEIGHTS = "C:/Users/Nipun's Lovely PC/badapple-fly/data/raw/connections.feather"
 DOWNLOAD_CMD = ("gsutil cp gs://flyem-male-cns/v1.0/connectome-data/flat-connectome/"
                 "connectome-weights-male-cns-v1.0-minconf-0.5.feather C:/FlyBrain/")
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_settings.json")
+LAYOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_layout.json")
+SETTING_DEFAULTS = {
+    # performance
+    "fps": "30", "body_hz": "30", "only_open": True, "show_fps": False,
+    "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True,
+    # body and physics
+    "kp": 50.0, "adh": 3.0, "fric": 2.0, "stepmax": 2.4, "lift": 0.25, "hind": 2.2, "fmax": 5.0, "stance": 0.7, "gaze": 1.0,
+    "gait": "Tripod", "grav": "Earth",
+    # smell and wind
+    "thr": 0.04, "diff": 0.3, "rate": 90.0, "maxn": 9000.0, "turb": 0.8, "wind_mode": "Steady", "smoke_obst": True,
+    # build tab
+    "show_grid": True, "show_trail": True, "snap": False,
+    # display
+    "topmost": True, "start_min": True,
+    # advanced
+    "print_timings": False,
+    "profile": "Balanced",
+}
+GAITS = {
+    "Tripod": {"lf": 0.0, "rm": 0.0, "lh": 0.0, "rf": 0.5, "lm": 0.5, "rh": 0.5},
+    "Tetrapod (experimental)": {"lf": 0.0, "rm": 0.0, "lh": 1 / 3, "rf": 1 / 3, "lm": 2 / 3, "rh": 2 / 3},
+    "Wave (experimental)": {"rh": 0.0, "rm": 1 / 6, "rf": 2 / 6, "lh": 3 / 6, "lm": 4 / 6, "lf": 5 / 6},
+}
+GRAVITY = {"Earth": 1.0, "Moon": 0.165, "Zero-g": 0.0}
+PROFILES = {
+    "Balanced": {"fps": "30", "body_hz": "30", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
+    "Performance": {"fps": "20", "body_hz": "15", "only_open": True, "draw_body": True, "draw_cloud": False, "draw_graphs": False, "draw_smoke": False},
+    "Quality": {"fps": "60", "body_hz": "60", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
+}
 BRAIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_subset.npz")
 DYN_LABEL = "Dynamic environment (default)"
 BASE_LABEL = "Baseline - no stimulation"
@@ -1672,6 +1727,23 @@ class NeuroMechFlyBody:
         return out
 
     # --------------------------------------------------------------- render
+    def apply_physics(self, kp, adhesion, friction, gravity):
+        """Push live settings into the running MuJoCo model: joint stiffness, foot adhesion, ground friction, gravity."""
+        m = getattr(self, 'model', None)
+        if m is None:
+            return
+        mjm = self.mj
+        joint = (m.actuator_trntype == int(mjm.mjtTrn.mjTRN_JOINT)) & (m.actuator_biastype == int(mjm.mjtBias.mjBIAS_AFFINE))
+        m.actuator_gainprm[joint, 0] = kp
+        m.actuator_biasprm[joint, 1] = -kp
+        adh = m.actuator_trntype == int(mjm.mjtTrn.mjTRN_BODY)
+        m.actuator_gainprm[adh, 0] = adhesion
+        gid = mjm.mj_name2id(m, mjm.mjtObj.mjOBJ_GEOM, "ground_plane")
+        if gid >= 0:
+            m.geom_friction[gid, 0] = friction
+        if not hasattr(self, "_g0"):
+            self._g0 = float(m.opt.gravity[2])
+        m.opt.gravity[2] = self._g0 * gravity
     def render(self, w, h):
         if self.renderer is None:
             img = np.full((h, w, 3), 245, np.uint8)
@@ -1682,7 +1754,7 @@ class NeuroMechFlyBody:
             cv2.putText(img, "Install lines: top of flylab.py", (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 60), 1, cv2.LINE_AA)
             return img
         now = time.perf_counter()
-        if self._cached is not None and now - self._t_last < max(0.033, 2.5 * self._render_s):
+        if self._cached is not None and now - self._t_last < max(getattr(self, 'render_dt', 0.033), 2.5 * self._render_s):
             return self._cached                            # slow GPU / software GL: reuse the last frame
         try:
             self.renderer.update_scene(self.data, camera=self.cam)
@@ -1937,12 +2009,15 @@ class FlyControllerApp:
         self.odor_now = (0.0, 0.0)
         self._eye_prev = None
         self.build_vision(tab_vis)
+        tab_set = ttk.Frame(self.nb)
+        self.nb.add(tab_set, text="   Settings   ")
+        self.build_settings(tab_set)
         tab_min = ttk.Frame(self.nb)
         self.nb.add(tab_min, text="   Minimize   ")
         self.build_minimized(tab_min)
         self.tab_min = tab_min
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
-        self.nb.select(tab_min)                                # start parked on the Minimize page
+        self.nb.select(tab_min if self.S("start_min") else tab_ctrl)      # start parked on the Minimize page (Settings > Display)
         self.tab_build = tab_build
         self.build_arena_tab(tab_build)
         self.build_setup(tab_setup)
@@ -2032,6 +2107,7 @@ class FlyControllerApp:
         self.vision_thread.start()
         self.update_preview()
         self.lab_t = time.perf_counter()
+        self.apply_settings()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
     # ------------------------------------------------------------------
@@ -2595,7 +2671,11 @@ class FlyControllerApp:
         feeding = False
         plume_on = self.smell_model.get() == SMELL_PLUME
         if plume_on:
-            self.arena.plume.update(dt, self.arena.foods, float(self.wind_speed_var.get()), float(self.wind_dir_var.get()))
+            wspd = float(self.wind_speed_var.get())
+            if self.S("wind_mode") == "Gusting":
+                wspd *= max(0.0, 1.0 + 0.6 * math.sin(now * 0.7) * math.sin(now * 0.23 + 1.0))
+            self.arena.plume.update(dt, self.arena.foods, wspd, float(self.wind_dir_var.get()), turb=float(self.S("turb")),
+                                    obstacles=self.arena.obstacles if self.S("smoke_obst") else ())
         if self.sim.running and dynamic:
             feeding = self.arena.feed(self.body.x, self.body.y, dt)
         cl = cr = 0.0                                      # odour at the two antennae (plume + any test pulse from the Miscellaneous page)
@@ -2671,11 +2751,12 @@ class FlyControllerApp:
             sel = str(self.tab_ctrl)
         if self.frame_i % 3 == 0:
             self.update_arena_view()
-        on_ctrl = sel == str(self.tab_ctrl)
         prime = not getattr(self, "_primed", False)            # first frame: draw every page once so the window knows its full size
         self._primed = True
-        if on_ctrl or prime:
+        on_ctrl = sel == str(self.tab_ctrl) or not self.S("only_open")
+        if prime or (on_ctrl and self.S("draw_body")):
             self.set_image(self.body_label, self.body.render(VIEW_W, VIEW_H))
+        if prime or (on_ctrl and self.S("draw_cloud")):
             self.set_image(self.cloud_label, self.render_cloud())
         self.status.set(
             f"t {self.sim.t_ms / 1000:6.1f}s  speed {self.sim.speed:4.2f}x  "
@@ -2687,7 +2768,7 @@ class FlyControllerApp:
         self._spk_prev = n_spk
         self.hist.append((now, rate, max(fwd, back, left, right), (time.perf_counter() - t_start) * 1000.0,
                           self.last_motion[0], self.last_motion[1]))
-        if self.graph_win is not None and ((self.frame_i % 2 == 0 and on_ctrl) or prime):
+        if self.graph_win is not None and ((self.frame_i % 2 == 0 and on_ctrl and self.S("draw_graphs")) or prime):
             self.draw_graphs()
         if self.frame_i % 3 == 2:
             try:
@@ -2703,7 +2784,12 @@ class FlyControllerApp:
                 if not getattr(self, "_motor_err", False):
                     self._motor_err = True
                     print("[!] Motor Properties page:", err)
-        self.root.after(33, self.update_lab)
+        self._fps = 0.9 * getattr(self, "_fps", 20.0) + 0.1 / max(dt, 0.001)
+        if self.S("show_fps"):
+            self.status.set(self.status.get() + f"\nfps {self._fps:4.1f}   frame {(time.perf_counter() - t_start) * 1000.0:4.0f} ms")
+        if self.S("print_timings") and self.frame_i % max(1, int(2000 / max(1, getattr(self, "frame_ms", 33)))) == 0:
+            print(f"[timing] fps {self._fps:4.1f}  frame {(time.perf_counter() - t_start) * 1000.0:5.1f} ms  filaments {len(self.arena.plume.age)}")
+        self.root.after(getattr(self, "frame_ms", 33), self.update_lab)
     # ------------------------------------------------------------------
     # BUILD TAB: place obstacles and food for the fly
     # ------------------------------------------------------------------
@@ -2748,7 +2834,7 @@ class FlyControllerApp:
         lf.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         self.wsim_label = tk.Label(lf, bd=0, bg="#10181a")
         self.wsim_label.pack(padx=6, pady=(2, 4))
-        self.wsim_paused = False
+        self.wsim_paused = True                                       # starts empty and paused
         self.wsim_label.bind("<Button-1>", self.wsim_click)         # the pause / clear icons are drawn into the picture itself
         self.wsim_label.bind("<Motion>", self.wsim_hover)
         self.wsim_info = tk.StringVar(value="")
@@ -2825,6 +2911,8 @@ class FlyControllerApp:
         x, y = (e.x - self.arena_px / 2) / sc, (self.arena_px / 2 - e.y) / sc
         if abs(x) > ARENA_HALF or abs(y) > ARENA_HALF:
             return
+        if self.S("snap"):
+            x, y = round(x / 5.0) * 5.0, round(y / 5.0) * 5.0
         tool = self.build_tool.get()
         if tool == "erase":
             self.arena.erase(x, y, 2.5)
@@ -2890,6 +2978,9 @@ class FlyControllerApp:
         except Exception:
             pass
     def wsim_clear(self):
+        if abs(getattr(self, "_wp_ys", ys) - ys) > 0.5 and getattr(self, "_wp", None) is not None:
+            self._wp.clear()                                    # window was resized: the source moved, restart the emission
+        self._wp_ys = ys
         wp = getattr(self, "_wp", None)
         if wp is not None:
             wp.clear()
@@ -2909,11 +3000,12 @@ class FlyControllerApp:
                 H = int(min(800, max(300, hh - 225)))
         except Exception:
             pass
+        paused = getattr(self, "wsim_paused", False)
+        if paused and not getattr(self, "_wsim_force", False) and getattr(self, "_wsim_drawn", False) and H == getattr(self, "_wsim_H", None):
+            return                                              # frozen: keep the last picture (but still follow window resizes)
         YH = XH * H / W                                        # half-height of the view in mm (<= 80)
         sp = float(self.wind_speed_var.get()) if hasattr(self, "wind_speed_var") else 0.0
         paused = getattr(self, "wsim_paused", False)
-        if paused and not getattr(self, "_wsim_force", False) and getattr(self, "_wsim_drawn", False):
-            return                                              # frozen: keep the last picture
         self._wsim_force = False
         self._wsim_drawn = True
         ys = YH - 6.0                                          # the source sits near the top; the wind blows downwards
@@ -2922,8 +3014,6 @@ class FlyControllerApp:
             wp = self._wp = Plume(80.0)
             wp.rng = np.random.default_rng(11)
             self._wp_t = time.monotonic()
-            for _ in range(160):
-                wp.update(0.1, [(0.0, ys, 1.0)], sp, 270.0)
         now = time.monotonic()
         dt = min(0.2, max(0.0, now - getattr(self, "_wp_t", now)))
         self._wp_t = now
@@ -2945,6 +3035,8 @@ class FlyControllerApp:
             if y < -YH:
                 break
             cv2.line(big, px(-XH, y), px(XH, y), (60, 52, 40), 1)
+            if px(0, y)[1] > H - 48:
+                continue                                        # keep the bottom-left corner free for the scale bar
             cv2.putText(big, f"{d} mm", (4, px(0, y)[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (170, 170, 170), 1, cv2.LINE_AA)
         cv2.line(big, px(0, YH), px(0, -YH), (60, 52, 40), 1)
         cv2.circle(big, px(0, ys), 6, (31, 140, 240), -1, cv2.LINE_AA)
@@ -3005,7 +3097,7 @@ class FlyControllerApp:
         if self._arena_ver != self.arena.version:
             self._arena_ver = self.arena.version
             cv.delete("static")
-            for g in range(-30, 40, 10):
+            for g in (range(-30, 40, 10) if self.S("show_grid") else ()):
                 a, _ = self._w2c(g, 0)
                 _, b = self._w2c(0, g)
                 cv.create_line(a, 0, a, self.arena_px, fill="#27393b", tags="static")
@@ -3032,7 +3124,7 @@ class FlyControllerApp:
         self._arena_primed = True
         cv.delete("smell")
         cv.delete("plume")
-        if on_build and self.smell_model.get() == SMELL_PLUME and len(self.arena.plume.age):
+        if on_build and self.S("draw_smoke") and self.smell_model.get() == SMELL_PLUME and len(self.arena.plume.age):
             img = self.plume_overlay()
             if img is not None:
                 cv.create_image(0, 0, anchor="nw", image=img, tags="plume")
@@ -3043,7 +3135,7 @@ class FlyControllerApp:
             if img is not None:
                 cv.create_image(0, 0, anchor="nw", image=img, tags="smell")
         cv.delete("fly")
-        if len(self.trail) > 1:
+        if len(self.trail) > 1 and self.S("show_trail"):
             pts = [c for x, y in self.trail for c in self._w2c(x, y)]
             cv.create_line(*pts, fill="#e5533d", width=1, tags="fly")
         cx, cy = self._w2c(b.x, b.y)
@@ -3447,9 +3539,12 @@ class FlyControllerApp:
         cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (170, 170, 170), 1)
         vl, vr = min(1.0, cl / 0.4), min(1.0, cr / 0.4)
         vp = 0.5 * (vl + vr) * 0.6                                # palps: the average, a bit weaker
-        cv2.putText(img, f"Left antenna  {cl:5.2f}", (x0 + 12, y0 + h - 56), F, 0.45, (200, 110, 30), 1, cv2.LINE_AA)
-        cv2.putText(img, f"Right antenna {cr:5.2f}", (x0 + 12, y0 + h - 38), F, 0.45, (30, 140, 230), 1, cv2.LINE_AA)
-        cv2.putText(img, f"Palps (est.)  {0.5 * (cl + cr) * 0.6:5.2f}", (x0 + 12, y0 + h - 20), F, 0.45, (60, 150, 60), 1, cv2.LINE_AA)
+        for k, (lab_t, val, col) in enumerate((("Left antenna", cl, (200, 110, 30)), ("Right antenna", cr, (30, 140, 230)), ("Palps (est.)", 0.5 * (cl + cr) * 0.6, (60, 150, 60)))):
+            yy = y0 + h - 48 + 17 * k
+            cv2.putText(img, lab_t, (x0 + 12, yy), F, 0.45, col, 1, cv2.LINE_AA)
+            vt = f"{val:.2f}"
+            (tw, _), _ = cv2.getTextSize(vt, F, 0.45, 1)
+            cv2.putText(img, vt, (x0 + 150 - tw, yy), F, 0.45, col, 1, cv2.LINE_AA)      # values right-aligned in one column
         for i in range(70):                                       # colour bar: no odour -> strong
             t = i / 69.0
             c = tuple(int(u + (v - u) * t) for u, v in zip((225, 225, 225), (20, 120, 245)))
@@ -3467,7 +3562,7 @@ class FlyControllerApp:
         bx0, bx1 = max(0, xs.min() - pad), min(body.shape[1], xs.max() + pad)
         by0, by1 = max(0, ys.min() - pad), min(body.shape[0], ys.max() + pad)
         rgb, body = rgb[by0:by1, bx0:bx1], body[by0:by1, bx0:bx1]
-        area_h = h - 70
+        area_h = h - 82
         sc = min((w - 20) / body.shape[1], area_h / body.shape[0])
         tw, th = max(8, int(body.shape[1] * sc)), max(8, int(body.shape[0] * sc))
         rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_AREA)
@@ -3587,6 +3682,349 @@ class FlyControllerApp:
         cv.create_text(2, 12, text=note, anchor="w", font=(pix, 9), fill="#ffffff")
         cv.create_text(1, 11, text=note, anchor="w", font=(pix, 9), fill="#7a7a7a")
         tk.Label(box, text="Select a page to start", bg=bg, fg="#555555", font=(normal, small)).pack(pady=(2, 0))
+    # ------------------------------------------------------------------
+    # SETTINGS TAB
+    # ------------------------------------------------------------------
+    def S(self, key):
+        """Current value of a setting (falls back to the default if the control is missing or holds junk)."""
+        try:
+            return self.sv[key].get()
+        except Exception:
+            return SETTING_DEFAULTS[key]
+    def _sched_apply(self):
+        if getattr(self, "_apply_job", None) is not None:
+            try:
+                self.root.after_cancel(self._apply_job)
+            except Exception:
+                pass
+        self._apply_job = self.root.after(150, self.apply_settings)
+    def save_settings(self):
+        try:
+            data = {k: v.get() for k, v in self.sv.items()}
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+        except Exception as err:
+            print("[!] could not save settings:", err)
+    def apply_settings(self):
+        """Push every setting into the running program (called on any change, and once at start)."""
+        self._apply_job = None
+        try:
+            fps = max(5, min(120, int(float(self.S("fps")))))
+        except Exception:
+            fps = 30
+        self.frame_ms = max(5, int(1000 / fps))
+        b = getattr(self, "body", None)
+        try:
+            self.render_dt = 1.0 / max(5, int(float(self.S("body_hz"))))
+        except Exception:
+            self.render_dt = 1.0 / 30
+        if b is not None:
+            b.render_dt = self.render_dt
+            b.STEPMAX, b.LIFT, b.HIND_LIFT = float(self.S("stepmax")), float(self.S("lift")), float(self.S("hind"))
+            b.F_MAX = float(self.S("fmax"))
+            b.F_MIN = min(2.5, b.F_MAX)
+            b.STANCE = float(self.S("stance"))
+            b.GAZE_STAB = float(self.S("gaze"))
+            b.TRIPOD = dict(GAITS.get(self.S("gait"), GAITS["Tripod"]))
+            b.KP, b.ADHESION, b.FRICTION = float(self.S("kp")), float(self.S("adh")), float(self.S("fric"))
+            try:
+                b.apply_physics(b.KP, b.ADHESION, b.FRICTION, GRAVITY.get(self.S("grav"), 1.0))
+            except Exception as err:
+                print("[!] physics settings:", err)
+        OdorTracker.THR = float(self.S("thr"))
+        Plume.DIFF, Plume.RATE, Plume.MAXN = float(self.S("diff")), float(self.S("rate")), int(float(self.S("maxn")))
+        try:
+            self.root.attributes("-topmost", bool(self.S("topmost")))
+        except Exception:
+            pass
+        grid = (bool(self.S("show_grid")), bool(self.S("show_trail")))
+        if grid != getattr(self, "_grid_state", None):
+            self._grid_state = grid
+            if hasattr(self, "arena"):
+                self.arena.version += 1                           # redraw the map's static layer
+        self.save_settings()
+    def reset_settings(self, keys=None):
+        for k, d in SETTING_DEFAULTS.items():
+            if keys is None or k in keys:
+                try:
+                    self.sv[k].set(d)
+                except Exception:
+                    pass
+    def apply_profile(self):
+        pr = PROFILES.get(self.S("profile"))
+        if pr:
+            for k, v in pr.items():
+                self.sv[k].set(v)
+    def build_settings(self, parent):
+        """Settings page: categories on the left, the controls of the chosen category on the right. Everything is saved to flylab_settings.json."""
+        saved = {}
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except Exception:
+            pass
+        self.sv = {}
+        for key, d in SETTING_DEFAULTS.items():
+            val = saved.get(key, d)
+            if isinstance(d, bool):
+                v = tk.BooleanVar(value=bool(val))
+            elif isinstance(d, (int, float)):
+                try:
+                    v = tk.DoubleVar(value=float(val))
+                except Exception:
+                    v = tk.DoubleVar(value=float(d))
+            else:
+                v = tk.StringVar(value=str(val))
+            v.trace_add("write", lambda *_: self._sched_apply())
+            self.sv[key] = v
+        try:
+            import tkinter.font as tkfont
+            fams = set(tkfont.families(self.root))
+        except Exception:
+            fams = set()
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        pix = next((f for f in ("Terminal", "Fixedsys", "MS Sans Serif") if f in fams), "Consolas")
+        note = "Recommended to not touchy"
+        cv = tk.Canvas(parent, width=260, height=22, bg=bg, highlightthickness=0, bd=0)     # inset note, same style as the Minimize page
+        cv.place(x=10, y=8)
+        cv.create_text(2, 12, text=note, anchor="w", font=(pix, 9), fill="#ffffff")
+        cv.create_text(1, 11, text=note, anchor="w", font=(pix, 9), fill="#7a7a7a")
+        body = ttk.Frame(parent)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(38, 12))
+        names = ["Performance", "Body & physics", "Smell & wind", "Build tab", "Display", "Recording", "Profiles", "Advanced"]
+        lb = tk.Listbox(body, exportselection=False, activestyle="none", width=18, height=len(names), font=("Segoe UI", 10),
+                        relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbbbbb", selectbackground="#0067c0", selectforeground="white")
+        for n in names:
+            lb.insert(tk.END, "  " + n)
+        lb.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 14))
+        # one long scrollable page; the list on the left jumps to a heading
+        area = ttk.Frame(body)
+        area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sc_cv = tk.Canvas(area, highlightthickness=0, bd=0, bg=bg, width=720, height=420)
+        sbar = ttk.Scrollbar(area, orient=tk.VERTICAL, command=sc_cv.yview)
+        sc_cv.configure(yscrollcommand=sbar.set)
+        sbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sc_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        holder = ttk.Frame(sc_cv)
+        win = sc_cv.create_window(0, 0, window=holder, anchor="nw")
+        filler = ttk.Frame(holder, height=1)
+        pages = {}
+        def page(name):
+            f = ttk.Frame(holder)
+            f.pack(fill=tk.X, expand=True, padx=(0, 10), pady=(0, 18))
+            pages[name] = f
+            ttk.Label(f, text=name, font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+            return f
+        def box(f, title):
+            b = ttk.LabelFrame(f, text=" " + title + " ", padding=8)
+            b.pack(fill=tk.X, pady=(0, 8))
+            return b
+        def check(f, text, key):
+            ttk.Checkbutton(f, text=text, variable=self.sv[key]).pack(anchor=tk.W, pady=1)
+        def combo(f, text, key, values, width=24):
+            r = ttk.Frame(f)
+            r.pack(fill=tk.X, pady=2)
+            ttk.Label(r, text=text, width=26).pack(side=tk.LEFT)
+            ttk.Combobox(r, textvariable=self.sv[key], values=values, state="readonly", width=width).pack(side=tk.LEFT)
+        def slide(f, text, key, lo, hi, fmt):
+            self.make_slider(f, text, self.sv[key], lo, hi, fmt, label_w=26)
+        # --- Performance
+        f = page("Performance")
+        b = box(f, "Speed")
+        combo(b, "Program frame rate (fps)", "fps", ("10", "15", "20", "30", "45", "60"))
+        combo(b, "Body view refresh (Hz)", "body_hz", ("10", "15", "20", "30", "60"))
+        check(b, "Only draw the page that is open", "only_open")
+        check(b, "Show fps and frame time on the Control Panel", "show_fps")
+        b = box(f, "What to draw")
+        check(b, "Fly body view", "draw_body")
+        check(b, "Neuron cloud", "draw_cloud")
+        check(b, "Time graphs", "draw_graphs")
+        check(b, "Smoke on the Build map", "draw_smoke")
+        # --- Body & physics
+        f = page("Body & physics")
+        b = box(f, "Motors and contact (applied live)")
+        slide(b, "Joint stiffness", "kp", 10.0, 120.0, "{:.0f}")
+        slide(b, "Foot adhesion", "adh", 0.0, 8.0, "{:.1f}")
+        slide(b, "Ground friction", "fric", 0.3, 4.0, "{:.1f}")
+        combo(b, "Gravity", "grav", tuple(GRAVITY))
+        b = box(f, "Walking")
+        combo(b, "Gait", "gait", tuple(GAITS))
+        slide(b, "Step length (mm)", "stepmax", 0.8, 4.0, "{:.1f}")
+        slide(b, "Step lift (mm)", "lift", 0.05, 0.6, "{:.2f}")
+        slide(b, "Hind-leg lift (x)", "hind", 1.0, 3.5, "{:.1f}")
+        slide(b, "Max step rate (Hz)", "fmax", 2.0, 9.0, "{:.1f}")
+        slide(b, "Foot-on-ground time", "stance", 0.5, 0.85, "{:.2f}")
+        slide(b, "Head stabilisation", "gaze", 0.0, 1.5, "{:.1f}")
+        ttk.Button(f, text="Reset body & physics to defaults",
+                   command=lambda: self.reset_settings(("kp", "adh", "fric", "grav", "gait", "stepmax", "lift", "hind", "fmax", "stance", "gaze"))).pack(anchor=tk.W)
+        # --- Smell & wind
+        f = page("Smell & wind")
+        b = box(f, "Plume")
+        slide(b, "Source strength (puffs/s)", "rate", 20.0, 200.0, "{:.0f}")
+        slide(b, "Spreading (diffusion)", "diff", 0.05, 1.0, "{:.2f}")
+        slide(b, "Max particles", "maxn", 2000.0, 20000.0, "{:.0f}")
+        slide(b, "Wind turbulence", "turb", 0.0, 2.0, "{:.1f}")
+        combo(b, "Wind mode", "wind_mode", ("Steady", "Gusting"))
+        check(b, "Smoke flows around obstacles", "smoke_obst")
+        b = box(f, "Fly's nose")
+        slide(b, "Detection threshold", "thr", 0.005, 0.3, "{:.3f}")
+        ttk.Button(f, text="Reset smell & wind to defaults",
+                   command=lambda: self.reset_settings(("rate", "diff", "maxn", "turb", "wind_mode", "smoke_obst", "thr"))).pack(anchor=tk.W)
+        # --- Build tab
+        f = page("Build tab")
+        b = box(f, "Map")
+        check(b, "Show grid", "show_grid")
+        check(b, "Show the fly's trail", "show_trail")
+        check(b, "Snap placing to a 5 mm grid", "snap")
+        b = box(f, "Layout")
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W)
+        ttk.Button(row, text="Save layout", command=self.save_layout).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Load layout", command=self.load_layout).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Randomize", command=self.randomize_layout).pack(side=tk.LEFT)
+        self.layout_msg = tk.StringVar(value="")
+        ttk.Label(b, textvariable=self.layout_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        # --- Display
+        f = page("Display")
+        b = box(f, "Window")
+        check(b, "Keep this window on top", "topmost")
+        check(b, "Start on the Minimize page", "start_min")
+        # --- Recording
+        f = page("Recording")
+        b = box(f, "Save")
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W)
+        ttk.Button(row, text="Screenshot of the fly view", command=self.save_screenshot).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Export graph data (CSV)", command=self.export_history).pack(side=tk.LEFT)
+        self.rec_msg = tk.StringVar(value="Files go next to flylab.py")
+        ttk.Label(b, textvariable=self.rec_msg, foreground="#555555", wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+        # --- Profiles
+        f = page("Profiles")
+        b = box(f, "Presets")
+        combo(b, "Profile", "profile", tuple(PROFILES))
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(row, text="Apply profile", command=self.apply_profile).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Reset ALL settings", command=lambda: self.reset_settings()).pack(side=tk.LEFT)
+        ttk.Label(b, text="Settings are saved automatically to flylab_settings.json and loaded next time.", foreground="#555555",
+                  wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        # --- Advanced
+        f = page("Advanced")
+        b = box(f, "Debug")
+        check(b, "Print frame timings to the console (every 2 s)", "print_timings")
+        ttk.Button(b, text="Copy diagnostic report", command=self.copy_report).pack(anchor=tk.W, pady=(4, 0))
+        self.adv_msg = tk.StringVar(value="")
+        ttk.Label(b, textvariable=self.adv_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        filler.pack(fill=tk.X)
+        def relayout(_e=None):
+            sc_cv.itemconfigure(win, width=max(50, sc_cv.winfo_width()))
+            last = pages[names[-1]]
+            filler.configure(height=max(1, sc_cv.winfo_height() - last.winfo_height() - 24))      # lets the last heading scroll to the top
+            sc_cv.configure(scrollregion=sc_cv.bbox("all"))
+        sc_cv.bind("<Configure>", relayout)
+        holder.bind("<Configure>", lambda _e: sc_cv.configure(scrollregion=sc_cv.bbox("all")))
+        def jump(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            relayout()
+            total = max(1, holder.winfo_height())
+            sc_cv.yview_moveto(max(0.0, (pages[names[sel[0]]].winfo_y() - 2) / total))
+        lb.bind("<<ListboxSelect>>", jump)
+        def wheel(e):
+            sc_cv.yview_scroll(int(-e.delta / 120) * 3, "units")
+            sync()
+        def sync(*_a):
+            # highlight the category whose heading is nearest the top of the view
+            try:
+                top = sc_cv.canvasy(0)
+                cur = 0
+                for i, n in enumerate(names):
+                    if pages[n].winfo_y() <= top + 30:
+                        cur = i
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(cur)
+            except Exception:
+                pass
+        area.bind("<Enter>", lambda _e: sc_cv.bind_all("<MouseWheel>", wheel))
+        area.bind("<Leave>", lambda _e: sc_cv.unbind_all("<MouseWheel>"))
+        sbar.bind("<B1-Motion>", lambda _e: sync())
+        sbar.bind("<ButtonRelease-1>", lambda _e: sync())
+        lb.selection_set(0)
+    def _here(self, name):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    def save_layout(self):
+        try:
+            with open(LAYOUT_FILE, "w", encoding="utf-8") as f:
+                json.dump({"obstacles": self.arena.obstacles, "foods": self.arena.foods, "food_spawn": self.arena.food_spawn}, f)
+            self.layout_msg.set("Saved to flylab_layout.json")
+        except Exception as err:
+            self.layout_msg.set(f"Could not save: {err}")
+    def load_layout(self):
+        try:
+            with open(LAYOUT_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.arena.obstacles = [list(map(float, o)) for o in d["obstacles"]]
+            self.arena.foods = [list(map(float, o)) for o in d["foods"]]
+            self.arena.food_spawn = [list(map(float, o)) for o in d.get("food_spawn", [o[:2] for o in d["foods"]])]
+            self.arena.version += 1
+            self.layout_msg.set("Loaded flylab_layout.json")
+        except Exception as err:
+            self.layout_msg.set(f"Nothing loaded: {err}")
+    def randomize_layout(self):
+        rng = random.Random()
+        obs, foods = [], []
+        for _ in range(rng.randint(4, 7)):
+            for _try in range(40):
+                x, y, r = rng.uniform(-32, 32), rng.uniform(-32, 32), rng.uniform(2.5, 6.0)
+                if math.hypot(x, y) > r + 7 and all(math.hypot(x - o[0], y - o[1]) > r + o[2] + 3 for o in obs):
+                    obs.append([x, y, r])
+                    break
+        for _ in range(6):
+            for _try in range(60):
+                x, y = rng.uniform(-34, 34), rng.uniform(-34, 34)
+                if math.hypot(x, y) > 10 and all(math.hypot(x - o[0], y - o[1]) > o[2] + 2.5 for o in obs):
+                    foods.append([x, y, 1.0])
+                    break
+        self.arena.obstacles, self.arena.foods = obs, foods
+        self.arena.food_spawn = [[f[0], f[1]] for f in foods]
+        self.arena.version += 1
+        self.layout_msg.set(f"Random layout: {len(obs)} obstacles, {len(foods)} food")
+    def save_screenshot(self):
+        try:
+            img = self.body.render(VIEW_W, VIEW_H)
+            path = self._here(time.strftime("flylab_shot_%Y%m%d_%H%M%S.png"))
+            cv2.imwrite(path, img)
+            self.rec_msg.set("Saved " + os.path.basename(path))
+        except Exception as err:
+            self.rec_msg.set(f"Could not save: {err}")
+    def export_history(self):
+        try:
+            rows = list(self.hist)
+            path = self._here(time.strftime("flylab_graph_%Y%m%d_%H%M%S.csv"))
+            t0 = rows[0][0] if rows else 0.0
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("time_s,spikes_per_s,drive,frame_ms\n")
+                for r in rows:
+                    f.write(f"{r[0] - t0:.3f},{r[1]:.1f},{r[2]:.3f},{r[3]:.2f}\n")
+            self.rec_msg.set(f"Saved {os.path.basename(path)} ({len(rows)} rows)")
+        except Exception as err:
+            self.rec_msg.set(f"Could not save: {err}")
+    def copy_report(self):
+        lines = [f"python {sys.version.split()[0]}", f"platform {sys.platform}", f"opencv {cv2.__version__}", f"numpy {np.__version__}"]
+        for mod in ("mujoco", "flygym"):
+            try:
+                lines.append(f"{mod} {__import__(mod).__version__}")
+            except Exception:
+                lines.append(f"{mod} not available")
+        lines.append(f"fps now {getattr(self, '_fps', 0.0):.1f}   body error: {getattr(self.body, 'error', None)}")
+        lines += [f"{k} = {v.get()}" for k, v in self.sv.items()]
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(lines))
+            self.adv_msg.set("Copied to the clipboard")
+        except Exception as err:
+            self.adv_msg.set(f"Could not copy: {err}")
     def on_tab_changed(self, _e=None):
         try:
             if self.nb.select() == str(self.tab_min):
