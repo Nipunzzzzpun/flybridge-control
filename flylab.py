@@ -1187,6 +1187,7 @@ SETTING_DEFAULTS = {
     "topmost": True, "start_min": True,
     # advanced
     "print_timings": False,
+    "shadows": False,
     "profile": "Balanced",
 }
 GAITS = {
@@ -1196,9 +1197,9 @@ GAITS = {
 }
 GRAVITY = {"Earth": 1.0, "Moon": 0.165, "Zero-g": 0.0}
 PROFILES = {
-    "Balanced": {"fps": "30", "body_hz": "30", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
-    "Performance": {"fps": "20", "body_hz": "15", "only_open": True, "draw_body": True, "draw_cloud": False, "draw_graphs": False, "draw_smoke": False},
-    "Quality": {"fps": "60", "body_hz": "60", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
+    "Balanced": {"shadows": False, "fps": "30", "body_hz": "30", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
+    "Performance": {"shadows": False, "fps": "20", "body_hz": "15", "only_open": True, "draw_body": True, "draw_cloud": False, "draw_graphs": False, "draw_smoke": False},
+    "Quality": {"shadows": True, "fps": "60", "body_hz": "60", "only_open": True, "draw_body": True, "draw_cloud": True, "draw_graphs": True, "draw_smoke": True},
 }
 BRAIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_subset.npz")
 DYN_LABEL = "Dynamic environment (default)"
@@ -1727,6 +1728,14 @@ class NeuroMechFlyBody:
         return out
 
     # --------------------------------------------------------------- render
+    shadows = False                                  # shadows + reflections roughly double the cost of every 3-D frame on software OpenGL
+    def _shade(self, rend):
+        try:
+            f = self.mj.mjtRndFlag
+            rend.scene.flags[f.mjRND_SHADOW] = int(self.shadows)
+            rend.scene.flags[f.mjRND_REFLECTION] = int(self.shadows)
+        except Exception:
+            pass
     def apply_physics(self, kp, adhesion, friction, gravity):
         """Push live settings into the running MuJoCo model: joint stiffness, foot adhesion, ground friction, gravity."""
         m = getattr(self, 'model', None)
@@ -1758,6 +1767,7 @@ class NeuroMechFlyBody:
             return self._cached                            # slow GPU / software GL: reuse the last frame
         try:
             self.renderer.update_scene(self.data, camera=self.cam)
+            self._shade(self.renderer)
             self._draw_arena()
             img = cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
             done = time.perf_counter()
@@ -1802,6 +1812,7 @@ class NeuroMechFlyBody:
                 if seg:
                     r.enable_segmentation_rendering()
                 r.update_scene(d, camera=cam)
+                self._shade(r)
                 sc = r.scene
                 for gi in range(sc.ngeom):
                     g = sc.geoms[gi]
@@ -1847,6 +1858,7 @@ class NeuroMechFlyBody:
                 cam.azimuth = math.degrees(math.atan2(f[1], f[0]))
                 cam.elevation = math.degrees(math.asin(max(-1.0, min(1.0, f[2]))))
                 self.eye_renderer.update_scene(d, camera=cam)
+                self._shade(self.eye_renderer)
                 for k in range(2):                           # roll the camera with the head (a free camera always keeps world-up)
                     gc = self.eye_renderer.scene.camera[k]
                     gc.pos[:] = pos + f * 0.12
@@ -2304,35 +2316,46 @@ class FlyControllerApp:
         scale = ttk.Scale(row, from_=lo, to=hi, variable=var, orient=tk.HORIZONTAL, command=changed)
         scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         return scale
-    def make_dial(self, parent, var, size=112):
-        """Windows-style circular dial (angle 0-359 deg): light-blue track, blue arc up to the value, round knob with a soft halo and the angle in the middle.
-        Drag it, click on the ring, or use the mouse wheel (5 deg per notch). 0 deg = east (same as the wind compass), turning counter-clockwise."""
+    def make_dial(self, parent, var, size=118):
+        """Circular version of the plain Windows slider: the thin grey groove of the plain Windows slider bent into a ring, with its blue 11 x 23 thumb (no fill, no animation).
+        Drag it, click the ring, scroll (5 deg per notch) or use the arrow keys when it has focus. The number is the compass bearing (0 = north, 90 = east, clockwise); the stored value is still the map angle (0 = east, counter-clockwise)."""
         bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
-        cv = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
-        c0, R = size / 2.0, size / 2.0 - 17
-        accent, track, halo = "#0067c0", "#cfe0f5", "#c4daf3"
+        cv = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0, takefocus=1)
+        c0, R = size / 2.0, size / 2.0 - 14
+        try:                                                      # same font as the other slider values (the Windows default UI font), just bigger
+            import tkinter.font as tkfont
+            num_font = tkfont.nametofont("TkDefaultFont").copy()
+            num_font.configure(size=20)
+        except Exception:
+            num_font = ("Segoe UI", 20)
         def draw(*_a):
             try:
                 d = float(var.get()) % 360.0
             except Exception:
                 d = 0.0
             cv.delete("all")
-            cv.create_oval(c0 - R, c0 - R, c0 + R, c0 + R, outline=track, width=5)
-            if d > 0.5:
-                cv.create_arc(c0 - R, c0 - R, c0 + R, c0 + R, start=0, extent=d, style="arc", outline=accent, width=5)
+            cv.create_oval(c0 - R, c0 - R, c0 + R, c0 + R, outline="#d2d2d2", width=3)       # thin groove: grey edge ...
+            cv.create_oval(c0 - R, c0 - R, c0 + R, c0 + R, outline="#e8e8e8", width=1)       # ... light line inside
             a = math.radians(d)
-            kx, ky = c0 + R * math.cos(a), c0 - R * math.sin(a)
-            cv.create_oval(kx - 14, ky - 14, kx + 14, ky + 14, fill=halo, outline="")
-            cv.create_oval(kx - 8, ky - 8, kx + 8, ky + 8, fill="#ffffff", outline=accent, width=4)
-            cv.create_text(c0, c0, text=f"{d:.0f}\u00b0", font=("Segoe UI", 12, "bold"), fill="#1b1b1b")
+            ux, uy = math.cos(a), -math.sin(a)                       # outward direction on screen
+            tx, ty = -uy, ux                                          # along the ring
+            kx, ky = c0 + R * ux, c0 + R * uy
+            pts = []
+            for sr, st in ((1, 1), (1, -1), (-1, -1), (-1, 1)):       # the 11 x 23 px Windows slider thumb, standing across the groove
+                pts += [kx + ux * 11.5 * sr + tx * 5.5 * st, ky + uy * 11.5 * sr + ty * 5.5 * st]
+            cv.create_polygon(*pts, fill="#0078d7", outline="#0078d7")
+            cv.create_text(c0, c0, text=f"{(90.0 - d) % 360.0:.0f}\u00b0", font=num_font, fill="#000000")      # compass bearing: 0 = north, clockwise
         def drag(e):
             deg = math.degrees(math.atan2(c0 - e.y, e.x - c0)) % 360.0
             var.set(float(round(deg)) % 360.0)
-        def wheel(e):
-            var.set((float(var.get()) + (5.0 if e.delta > 0 else -5.0)) % 360.0)
+            cv.focus_set()
+        def step(delta):
+            var.set((float(var.get()) - delta) % 360.0)                # +delta = clockwise (bearing goes up)
         cv.bind("<Button-1>", drag)
         cv.bind("<B1-Motion>", drag)
-        cv.bind("<MouseWheel>", wheel)
+        cv.bind("<MouseWheel>", lambda e: step(5.0 if e.delta > 0 else -5.0))
+        for key, dlt in (("<Right>", 1.0), ("<Up>", 1.0), ("<Left>", -1.0), ("<Down>", -1.0), ("<Prior>", 15.0), ("<Next>", -15.0)):
+            cv.bind(key, lambda _e, d=dlt: step(d))
         var.trace_add("write", draw)
         draw()
         return cv
@@ -2847,7 +2870,7 @@ class FlyControllerApp:
         mb["menu"] = mn
         mb.pack(anchor=tk.W)
         self.wind_speed_var = tk.DoubleVar(value=8.0)
-        self.wind_dir_var = tk.DoubleVar(value=0.0)
+        self.wind_dir_var = tk.DoubleVar(value=90.0)           # default: the knob (and the wind) points north
         self.make_slider(side, "Wind speed (mm/s)", self.wind_speed_var, 0.0, 25.0, "{:.0f}", label_w=17)
         drow = ttk.Frame(side)
         drow.pack(fill=tk.X, pady=(4, 2))
@@ -2862,7 +2885,7 @@ class FlyControllerApp:
         ttk.Label(side, textvariable=self.arena_info, justify=tk.LEFT).pack(anchor=tk.W, pady=(12, 0))
         panel_bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
         # bottom: live wind compass (black = direction, blue = velocity), fills the free space
-        self.wind_canvas = tk.Canvas(side, width=270, height=280, bg=panel_bg, highlightthickness=0, bd=0)
+        self.wind_canvas = tk.Canvas(side, width=270, height=184, bg=panel_bg, highlightthickness=0, bd=0)
         self.wind_canvas.pack(side=tk.BOTTOM, anchor=tk.W, pady=(8, 0))
         # column between the sidebar and the arena: Individualized Simulation = close-up of the live odour plume with numbers
         lf = ttk.LabelFrame(parent, text="Individualized Simulation")
@@ -2969,9 +2992,9 @@ class FlyControllerApp:
         wc.delete("all")
         speed = float(self.wind_speed_var.get()) if hasattr(self, "wind_speed_var") else 0.0
         th = getattr(self.arena.plume, "wind_dir", 0.0)
-        ox, oy, r = 135, 168, 82
+        ox, oy, r = 186, 98, 64
         wc.create_text(4, 4, anchor="nw", text="Wind", font=("Arial", 10, "bold"))
-        wc.create_text(4, 20, anchor="nw", text=f"{speed:.0f} mm/s   {math.degrees(th) % 360:.0f} deg", font=("Arial", 9, "bold"))
+        wc.create_text(4, 20, anchor="nw", text=f"{speed:.0f} mm/s   {(90.0 - math.degrees(th)) % 360:.0f} deg", font=("Arial", 9, "bold"))
         wc.create_text(4, 35, anchor="nw", text="black = direction\nblue = velocity", font=("Arial", 8), fill="#555555")
         wc.create_oval(ox - r, oy - r, ox + r, oy + r, outline="#888888", width=2)
         wc.create_oval(ox - r * 0.5, oy - r * 0.5, ox + r * 0.5, oy + r * 0.5, outline="#cccccc")
@@ -3102,7 +3125,7 @@ class FlyControllerApp:
         mark = lambda x: "smelled" if x > thr else "faint"
         self.wsim_info.set(
             f"wind speed   {sp:5.1f} mm/s  (shown downward)\n"
-            f"map wind dir {float(self.wind_dir_var.get()) if hasattr(self, 'wind_dir_var') else 0.0:5.0f} deg\n"
+            f"map wind dir {(90.0 - (float(self.wind_dir_var.get()) if hasattr(self, 'wind_dir_var') else 0.0)) % 360:5.0f} deg (0 = N)\n"
             f"filaments    {len(wp.age):5d}   mean age {age:4.1f} s\n"
             f"plume reach  {reach:5.1f} mm   width@25mm {wid:4.1f} mm\n"
             f"odour  10 mm {c[0]:5.3f}  {mark(c[0])}\n"
@@ -3671,7 +3694,11 @@ class FlyControllerApp:
         hh = H - y0 - 14
         dw = int(min(W * 0.30, hh * 1.1))
         cl, cr = self.odor_now
-        head = self.body.render_head() if getattr(self.body, 'renderer', None) is not None else None
+        tnow = time.monotonic()                                   # the head close-up takes ~0.6 s to render and barely changes: refresh it every 3 s
+        if getattr(self, "_head_cache", None) is None or tnow - getattr(self, "_head_t", 0.0) > 3.0:
+            self._head_cache = self.body.render_head() if getattr(self.body, 'renderer', None) is not None else None
+            self._head_t = tnow
+        head = self._head_cache
         self._smell_diagram(img, 14, y0 + 24, dw, hh - 24, cl, cr, head)
         oh = list(self.odor_hist)
         ot = [h[0] for h in oh]
@@ -3755,6 +3782,7 @@ class FlyControllerApp:
             self.render_dt = 1.0 / 30
         if b is not None:
             b.render_dt = self.render_dt
+            b.shadows = bool(self.S("shadows"))
             b.STEPMAX, b.LIFT, b.HIND_LIFT = float(self.S("stepmax")), float(self.S("lift")), float(self.S("hind"))
             b.F_MAX = float(self.S("fmax"))
             b.F_MIN = min(2.5, b.F_MAX)
@@ -3827,11 +3855,13 @@ class FlyControllerApp:
         body = ttk.Frame(parent)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(38, 12))
         names = ["Performance", "Body & physics", "Smell & wind", "Build tab", "Display", "Recording", "Profiles", "Advanced"]
-        lb = tk.Listbox(body, exportselection=False, activestyle="none", width=18, height=len(names), font=("Segoe UI", 10),
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 14))
+        lb = tk.Listbox(left, exportselection=False, activestyle="none", width=18, height=len(names), font=("Segoe UI", 10),
                         relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbbbbb", selectbackground="#0067c0", selectforeground="white")
         for n in names:
             lb.insert(tk.END, "  " + n)
-        lb.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 14))
+        lb.pack(side=tk.TOP, anchor=tk.N)
         # one long scrollable page; the list on the left jumps to a heading
         area = ttk.Frame(body)
         area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -3870,6 +3900,7 @@ class FlyControllerApp:
         combo(b, "Body view refresh (Hz)", "body_hz", ("10", "15", "20", "30", "60"))
         check(b, "Only draw the page that is open", "only_open")
         check(b, "Show fps and frame time on the Control Panel", "show_fps")
+        check(b, "Shadows and reflections in the 3-D views (slower)", "shadows")
         b = box(f, "What to draw")
         check(b, "Fly body view", "draw_body")
         check(b, "Neuron cloud", "draw_cloud")
@@ -3940,7 +3971,8 @@ class FlyControllerApp:
         row = ttk.Frame(b)
         row.pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(row, text="Apply profile", command=self.apply_profile).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(row, text="Reset ALL settings", command=lambda: self.reset_settings()).pack(side=tk.LEFT)
+        tk.Button(row, text="Reset ALL settings", command=lambda: self.reset_settings(), bg="#c42b1c", fg="#ffffff", activebackground="#a52215",
+                  activeforeground="#ffffff", relief=tk.FLAT, bd=0, highlightthickness=0, cursor="hand2", font=("Segoe UI", 9), padx=10, pady=3).pack(side=tk.LEFT)
         ttk.Label(b, text="Settings are saved automatically to flylab_settings.json and loaded next time.", foreground="#555555",
                   wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         # --- Advanced
