@@ -320,6 +320,8 @@ FOOD_RANGE = 22.0          # mm, how far the fly "smells" food
 AVOID_RANGE = 6.0          # mm, how far ahead it "sees" obstacles and walls
 EAT_RANGE = 1.6            # mm
 EAT_SECONDS = 4.0          # how long one food pellet takes to eat
+ODOR_PULSE = 0.35                                      # concentration a test pulse adds at an antenna
+SMELL_PLUME, SMELL_RADIUS = "Plume (fluid dynamics)", "Radius (instant)"
 ENV_RATE_HZ = 600.0        # Poisson rate on a descending-neuron group at full command
 UP_POOL = 120              # strongest upstream (premotor) neurons per DN group that carry the command into the network
 POP_REF = 0.0025           # population rate (spikes per neuron per ms, = 2.5 Hz) above which global inhibition damps the synapses
@@ -335,6 +337,17 @@ class Arena:
         self.eaten = 0
         self.smell_range = FOOD_RANGE                      # mm: how far the smell of food reaches (Build tab slider)
         self.version = 0                                   # bumped whenever the layout changes (UI redraw)
+        self.plume = Plume(self.half)
+    def antennae(self, x, y, h):
+        c, s = math.cos(h), math.sin(h)
+        return np.array([[x + c * 1.0 - s * 0.8, y + s * 1.0 + c * 0.8], [x + c * 1.0 + s * 0.8, y + s * 1.0 - c * 0.8]])
+    def near_food(self, x, y, h, rng=5.0):
+        best = None
+        for fx, fy, _a in self.foods:
+            d = math.hypot(fx - x, fy - y)
+            if d < rng and (best is None or d < best[0]):
+                best = (d, wrap_pi(math.atan2(fy - y, fx - x) - h))
+        return None if best is None else best[1]
     def default_layout(self):
         self.obstacles = [[-14.0, 10.0, 4.0], [12.0, -8.0, 5.0], [18.0, 18.0, 3.0], [-20.0, -18.0, 4.5]]
         self.food_spawn = [[-26.0, 24.0], [26.0, 4.0], [0.0, -26.0], [-8.0, 27.0], [29.0, -22.0], [-30.0, -4.0]]
@@ -355,6 +368,7 @@ class Arena:
         self.version += 1
     def clear(self):
         self.obstacles, self.foods, self.food_spawn = [], [], []
+        self.plume.clear()
         self.version += 1
     def refill(self):
         self.foods = [[f[0], f[1], 1.0] for f in self.food_spawn]
@@ -415,6 +429,129 @@ class Arena:
             if abs(th) < 0.45:
                 out["front"] = max(out["front"], st)
         return out
+class Plume:
+    """Odour plume as a cloud of drifting puffs (a filament / particle model of turbulent advection-diffusion).
+    Every food pellet releases puffs; the wind carries them downwind, slow eddies make the stream meander and billow,
+    and each puff spreads out as it ages (diffusion) while its odour gets thinner. 2-D, mm / s."""
+    MAXN, LIFE, RATE, S0, DIFF = 9000, 15.0, 90.0, 0.4, 0.3
+    def __init__(self, half):
+        self.half = half
+        self.rng = np.random.default_rng(3)
+        self.clear()
+        self.theta = 0.0                                   # wind direction (rad, direction the wind blows TOWARD)
+        self.t = 0.0
+        self._emit = 0.0
+        self.phase = self.rng.uniform(0, 2 * math.pi, 3)
+        self.wind_dir = 0.0
+    def clear(self):
+        self.pos = np.zeros((0, 2))
+        self.vt = np.zeros((0, 2))                         # per-puff turbulent velocity
+        self.age = np.zeros(0)
+    def update(self, dt, foods, speed, direction_deg, turb=0.8):
+        dt = min(dt, 0.1)
+        self.t += dt
+        base = math.radians(direction_deg)
+        self.theta += (0.0 - self.theta) * dt / 8.0 + math.sqrt(2 * dt / 8.0) * 0.3 * turb * float(self.rng.normal())
+        self.theta = float(np.clip(self.theta, -0.7, 0.7))
+        th = base + self.theta
+        self.wind_dir = th
+        wx, wy = math.cos(th), math.sin(th)
+        nx, ny = -wy, wx
+        if len(self.age):
+            x, y = self.pos[:, 0], self.pos[:, 1]
+            sa = x * wx + y * wy                           # coordinate along the wind
+            u_perp = np.zeros_like(sa)
+            for k, (wl, om, amp) in enumerate(((26.0, 0.9, 0.9), (13.0, 1.9, 0.55), (7.0, 3.1, 0.25))):
+                u_perp += amp * np.sin(2 * math.pi * sa / wl - om * self.t + self.phase[k])      # eddies: the stream snakes and billows
+            u_perp *= speed * turb * (0.4 + 0.6 * np.minimum(1.0, self.age / 3.0))
+            tau = 0.7
+            self.vt += -self.vt * dt / tau + math.sqrt(2 * dt / tau) * 0.12 * speed * turb * self.rng.normal(size=self.vt.shape)
+            self.pos[:, 0] += (wx * speed + nx * u_perp + self.vt[:, 0]) * dt
+            self.pos[:, 1] += (wy * speed + ny * u_perp + self.vt[:, 1]) * dt
+            self.age += dt
+            h = self.half + 6.0
+            keep = (self.age < self.LIFE) & (np.abs(self.pos[:, 0]) < h) & (np.abs(self.pos[:, 1]) < h)
+            if not keep.all():
+                self.pos, self.vt, self.age = self.pos[keep], self.vt[keep], self.age[keep]
+        self._emit += dt * self.RATE
+        n_new = int(self._emit)
+        self._emit -= n_new
+        if foods and n_new:
+            for fx, fy, amt in foods:
+                if len(self.age) >= self.MAXN:
+                    break
+                k = max(1, int(n_new * min(1.0, 0.3 + amt)))
+                p = np.array([fx, fy]) + self.rng.normal(scale=0.15, size=(k, 2))
+                self.pos = np.vstack([self.pos, p])
+                self.vt = np.vstack([self.vt, np.zeros((k, 2))])
+                self.age = np.concatenate([self.age, np.zeros(k)])
+    def burst(self, x, y, n=160):
+        """A sudden puff of odour at (x, y) (the 'Puff ahead' trigger)."""
+        p = np.array([x, y]) + self.rng.normal(scale=0.6, size=(n, 2))
+        self.pos = np.vstack([self.pos, p])
+        self.vt = np.vstack([self.vt, np.zeros((n, 2))])
+        self.age = np.concatenate([self.age, np.zeros(n)])
+    def sigma(self):
+        return np.sqrt(self.S0 ** 2 + 2.0 * self.DIFF * self.age)
+    def amp(self):
+        sg = self.sigma()
+        return (self.S0 / sg) ** 2 * np.exp(-self.age / 14.0)
+    def conc(self, pts):
+        """Odour concentration at each (x, y) in pts (N, 2)."""
+        pts = np.asarray(pts, float)
+        if not len(self.age):
+            return np.zeros(len(pts))
+        sg = self.sigma()
+        d2 = ((pts[:, None, :] - self.pos[None, :, :]) ** 2).sum(-1)
+        return (self.amp()[None, :] * np.exp(-d2 / (2 * sg[None, :] ** 2))).sum(1) * 0.18
+    def density(self, G=150):
+        """Smoke picture for the Build map: (G, G) float 0..1, row 0 = top (+y)."""
+        out = np.zeros((G, G), np.float32)
+        if not len(self.age):
+            return out
+        h = self.half
+        w = 0.32 * np.exp(-self.age / 18.0)
+        for lo, hi, sg, gain in ((0.0, 4.0, 1.3, 1.0), (4.0, 9.0, 1.9, 1.4), (9.0, 99.0, 2.8, 2.0)):
+            m = (self.age >= lo) & (self.age < hi)
+            if not m.any():
+                continue
+            H, _, _ = np.histogram2d(self.pos[m, 1], self.pos[m, 0], bins=G, range=[[-h, h], [-h, h]], weights=w[m])
+            out += cv2.GaussianBlur(H[::-1].astype(np.float32), (0, 0), sg) * gain
+        return (1.0 - np.exp(-1.3 * out)).astype(np.float32)
+class OdorTracker:
+    """Plume tracking like a real fly: surge upwind while the odour is there, cast crosswind (wider and wider) when it is lost,
+    and walk straight at the food once it is close enough to see. Returns a (strength, bearing) pair like Arena.sense()['food']."""
+    THR = 0.04
+    def __init__(self):
+        self.c = 0.0
+        self.since = 99.0
+        self.cast = 1.0
+        self.cast_t = 0.0
+        self.cast_T = 1.0
+        self.last_th = 0.0
+    def update(self, dt, c_l, c_r, wind_dir, heading, near):
+        c = 0.5 * (c_l + c_r)
+        self.c += (c - self.c) * min(1.0, dt / 0.15)
+        hit = self.c > self.THR
+        if hit:
+            self.since, self.cast_T, self.cast_t = 0.0, 1.0, 0.0
+        else:
+            self.since += dt
+        upwind = wind_dir + math.pi
+        if near is not None:
+            return (1.0, near)
+        if hit:
+            grad = (c_l - c_r) / (c_l + c_r + 1e-6)         # + = stronger on the left antenna
+            self.last_th = wrap_pi(upwind - heading) + 0.9 * grad
+            return (min(1.0, 0.5 + 4.0 * self.c), self.last_th)
+        if self.since < 0.4:
+            return (0.6, self.last_th)
+        if self.since < 9.0:                                # lost the plume: cast crosswind, wider each time
+            self.cast_t += dt
+            if self.cast_t > self.cast_T:
+                self.cast, self.cast_t, self.cast_T = -self.cast, 0.0, min(3.5, self.cast_T * 1.4)
+            return (0.6, wrap_pi(upwind + self.cast * 1.2 - heading))
+        return None
 class Explorer:
     """Slowly wandering command signals (Ornstein-Uhlenbeck noise): how fast to walk and which way to veer."""
     def __init__(self, seed=None):
@@ -1236,6 +1373,9 @@ class NeuroMechFlyBody:
                     self._in_head[bi] = True
                     break
                 k = int(m.body_parentid[k])
+        bid = lambda n: mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "nmf/" + n)
+        self.part_ids = {"lant": [bid("l_pedicel"), bid("l_funiculus"), bid("l_arista")],
+                         "rant": [bid("r_pedicel"), bid("r_funiculus"), bid("r_arista")], "palp": [bid("c_rostrum")]}
         self.neck_cmd = {"roll": 0.0, "pitch": 0.0}
         self.neck_opt = {"roll": 0.0, "pitch": 0.0}
         self.reset()
@@ -1568,6 +1708,47 @@ class NeuroMechFlyBody:
             adr = self.neck_adr.get(ax, -1)
             out.append(math.degrees(float(d.qpos[adr] - self.q_neutral[adr])) if adr >= 0 else 0.0)
         return tuple(out)
+    def render_head(self, w=480, h=400):
+        """Close-up of the real 3-D head (front view). Returns (rgb image, body id of every pixel, -1 = background) or None."""
+        if self.renderer is None or self.head_body < 0:
+            return None
+        mj, m, d = self.mj, self.model, self.data
+        try:
+            if getattr(self, "head_renderer", None) is None:
+                self.head_renderer = mj.Renderer(m, height=h, width=w)
+            r = self.head_renderer
+            hm = d.xmat[self.head_body].reshape(3, 3)
+            f = hm[:, 0]                                         # the fly's forward axis; the camera looks at the face
+            cam = mj.MjvCamera()
+            cam.type = mj.mjtCamera.mjCAMERA_FREE
+            cam.lookat[:] = d.xpos[self.head_body] + f * 0.42 + hm[:, 2] * -0.02
+            cam.distance = 1.45
+            cam.azimuth = math.degrees(math.atan2(-f[1], -f[0]))
+            cam.elevation = -14.0
+            outs = []
+            for seg in (False, True):
+                if seg:
+                    r.enable_segmentation_rendering()
+                r.update_scene(d, camera=cam)
+                sc = r.scene
+                for gi in range(sc.ngeom):
+                    g = sc.geoms[gi]
+                    if g.objtype == mj.mjtObj.mjOBJ_GEOM and 0 <= g.objid < m.ngeom and not self._in_head[m.geom_bodyid[g.objid]]:
+                        g.rgba[3] = 0.0
+                        if seg:
+                            g.segid = -1
+                outs.append(r.render().copy())
+                if seg:
+                    r.disable_segmentation_rendering()
+            rgb, sg = outs
+            body = np.full(sg.shape[:2], -1, np.int32)
+            ok = sg[:, :, 1] == int(mj.mjtObj.mjOBJ_GEOM)
+            gid = sg[:, :, 0].astype(np.int64)
+            ok &= (gid >= 0) & (gid < m.ngeom)
+            body[ok] = m.geom_bodyid[gid[ok]]
+            return rgb, body
+        except Exception:
+            return None
     def render_eyes(self):
         """Raw (greyscale) view of each compound eye, rendered from the head. Returns (left, right) uint8 arrays, or None."""
         if self.renderer is None or getattr(self, "eye_renderer", None) is None or self.head_body < 0:
@@ -1613,6 +1794,12 @@ class NeuroMechFlyBody:
             m.vis.global_.fovy = old
         return outs[0], outs[1]
     def close(self):
+        if getattr(self, "head_renderer", None) is not None:
+            try:
+                self.head_renderer.close()
+            except Exception:
+                pass
+            self.head_renderer = None
         if getattr(self, "eye_renderer", None) is not None:
             try:
                 self.eye_renderer.close()
@@ -1741,9 +1928,12 @@ class FlyControllerApp:
         self.tab_motor = tab_motor
         self.build_motors(tab_motor)
         tab_vis = ttk.Frame(self.nb)
-        self.nb.add(tab_vis, text="   Vision   ")
+        self.nb.add(tab_vis, text="   Miscellaneous   ")
         self.tab_vision = tab_vis
-        self.eye_hist = collections.deque(maxlen=120)
+        self.eye_hist = collections.deque(maxlen=900)
+        self.odor_hist = collections.deque(maxlen=900)
+        self.odor_pulse = {"l": 0.0, "r": 0.0}
+        self.odor_now = (0.0, 0.0)
         self._eye_prev = None
         self.build_vision(tab_vis)
         tab_min = ttk.Frame(self.nb)
@@ -1752,6 +1942,7 @@ class FlyControllerApp:
         self.tab_min = tab_min
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.nb.select(tab_min)                                # start parked on the Minimize page
+        self.tab_build = tab_build
         self.build_arena_tab(tab_build)
         self.build_setup(tab_setup)
         self.root.after(600, self.auto_build)
@@ -1867,6 +2058,7 @@ class FlyControllerApp:
         self.arena.default_layout()
         self.body.arena = self.arena
         self.explorer = Explorer()
+        self.tracker = OdorTracker()
         self.user_run = False                              # the simulation starts paused
         self.preset_var = tk.StringVar(value=DYN_LABEL)
         self.side_var = tk.StringVar(value="Both")
@@ -2225,6 +2417,7 @@ class FlyControllerApp:
         self.sim.reset()
         self.body.reset()
         self.explorer = Explorer()
+        self.tracker = OdorTracker()
     def clear_paint(self):
         self.stim_mask[:] = False
         self.sim.set_stim(self.stim_mask)
@@ -2399,12 +2592,28 @@ class FlyControllerApp:
         mode = self.preset_var.get()
         dynamic = mode == DYN_LABEL
         feeding = False
+        plume_on = self.smell_model.get() == SMELL_PLUME
+        if plume_on:
+            self.arena.plume.update(dt, self.arena.foods, float(self.wind_speed_var.get()), float(self.wind_dir_var.get()))
         if self.sim.running and dynamic:
             feeding = self.arena.feed(self.body.x, self.body.y, dt)
+        cl = cr = 0.0                                      # odour at the two antennae (plume + any test pulse from the Miscellaneous page)
+        if plume_on:
+            cl, cr = (float(v) for v in self.arena.plume.conc(self.arena.antennae(self.body.x, self.body.y, self.body.heading)))
+        t_now = time.perf_counter()
+        if self.odor_pulse["l"] > t_now:
+            cl += ODOR_PULSE
+        if self.odor_pulse["r"] > t_now:
+            cr += ODOR_PULSE
+        self.odor_now = (cl, cr)
+        self.odor_hist.append((t_now, cl, cr))
         if self.sim.running:
             ext = np.zeros(self.net.n, np.float32)
             if dynamic:                                    # wander + react to food / obstacles
                 sense = self.arena.sense(self.body.x, self.body.y, self.body.heading)
+                if plume_on or cl > 0.0 or cr > 0.0:       # smell = the plume (or a test pulse): antennae sample the odour, the tracker steers
+                    near = self.arena.near_food(self.body.x, self.body.y, self.body.heading)
+                    sense["food"] = self.tracker.update(dt, float(cl), float(cr), self.arena.plume.wind_dir, self.body.heading, near)
                 lvl, bk, lt, rt = env_commands(sense, self.explorer.update(dt))
                 # stuck-escape: if the fly has hardly moved for a few seconds (pinned at a wall / obstacle), turn away and walk off
                 self._stuck_clock = getattr(self, "_stuck_clock", 0.0) + dt
@@ -2502,16 +2711,14 @@ class FlyControllerApp:
             ttk.Radiobutton(side, text=text, variable=self.build_tool, value=val).pack(anchor=tk.W, pady=1)
         self.obst_r_var = tk.DoubleVar(value=4.0)
         self.make_slider(side, "Obstacle size (mm)", self.obst_r_var, 1.5, 9.0, "{:.1f}", label_w=17)
-        self.smell_var = tk.DoubleVar(value=self.arena.smell_range)
-        smell_scale = self.make_slider(side, "Smell radius (mm)", self.smell_var, 3.0, 60.0, "{:.0f}", label_w=17,
-                                       command=self.on_smell)
-        smell_scale.bind("<Enter>", lambda e: self.set_smell_state(hover=True), add="+")
-        smell_scale.bind("<Leave>", lambda e: self.set_smell_state(hover=False), add="+")
-        smell_scale.bind("<ButtonPress-1>", lambda e: self.set_smell_state(drag=True), add="+")
-        smell_scale.bind("<ButtonRelease-1>", lambda e: self.set_smell_state(drag=False), add="+")
-        ttk.Label(side, wraplength=210, justify=tk.LEFT, foreground="#666666", text=(
-            "How far the smell of food reaches. Hover or drag this slider to see each food's range as a circle; "
-            "the fly only turns toward food inside it.")).pack(anchor=tk.W, pady=(0, 4))
+        self.smell_model = tk.StringVar(value=SMELL_PLUME)
+        ttk.Label(side, text="Smell model").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Combobox(side, textvariable=self.smell_model, state="readonly", values=(SMELL_PLUME, SMELL_RADIUS), width=24).pack(anchor=tk.W)
+        self.wind_speed_var = tk.DoubleVar(value=8.0)
+        self.wind_dir_var = tk.DoubleVar(value=0.0)
+        self.make_slider(side, "Wind speed (mm/s)", self.wind_speed_var, 0.0, 25.0, "{:.0f}", label_w=17)
+        self.make_slider(side, "Wind direction (deg)", self.wind_dir_var, 0.0, 359.0, "{:.0f}", label_w=17)
+        self.smell_var = tk.DoubleVar(value=self.arena.smell_range)      # (no slider any more: the old radius mode keeps its default reach)
         ttk.Button(side, text="Refill food", command=self.arena.refill).pack(fill=tk.X, pady=(12, 2))
         ttk.Button(side, text="Reset fly", command=self.reset_fly).pack(fill=tk.X, pady=2)
         ttk.Button(side, text="Clear everything", command=self.arena.clear).pack(fill=tk.X, pady=2)
@@ -2603,6 +2810,23 @@ class FlyControllerApp:
             rx, ry = self.arena.resolve(x, y)
             self.body.teleport(rx, ry)
             self.trail = []
+    def plume_overlay(self):
+        """Grey smoke picture of the odour plume, drawn over the map (like a smoke-plume visualisation)."""
+        n = int(self.arena_px)
+        d = self.arena.plume.density(150)
+        d = cv2.resize(d, (n, n), interpolation=cv2.INTER_CUBIC)
+        a = np.clip(d, 0, 1) ** 0.8 * 235.0
+        col = np.empty((n, n, 3), np.float32)
+        col[:] = (232, 234, 236)
+        bgra = np.dstack([col, a]).clip(0, 255).astype(np.uint8)
+        png = to_png(bgra)
+        if png is None:
+            return None
+        try:
+            self._plume_img = tk.PhotoImage(data=base64.b64encode(png))
+        except tk.TclError:
+            self._plume_img = None
+        return self._plume_img
     def update_arena_view(self):
         cv = self.arena_canvas
         sc = self.arena_px / (2 * ARENA_HALF)
@@ -2628,14 +2852,25 @@ class FlyControllerApp:
             self.trail.append((b.x, b.y))
             self.trail = self.trail[-250:]
         cv.delete("smell")
-        if self.smell_show and self.arena.foods:
+        cv.delete("plume")
+        try:
+            on_build = self.nb.select() == str(self.tab_build)
+        except Exception:
+            on_build = True
+        if on_build and self.smell_model.get() == SMELL_PLUME and len(self.arena.plume.age):
+            img = self.plume_overlay()
+            if img is not None:
+                cv.create_image(0, 0, anchor="nw", image=img, tags="plume")
+                cv.tag_lower("plume")
+                cv.tag_lower("static")
+        if self.smell_show and self.arena.foods and self.smell_model.get() == SMELL_RADIUS:
             img = self.smell_overlay(sc)
             if img is not None:
                 cv.create_image(0, 0, anchor="nw", image=img, tags="smell")
         cv.delete("fly")
         if len(self.trail) > 1:
             pts = [c for x, y in self.trail for c in self._w2c(x, y)]
-            cv.create_line(*pts, fill="#4f9f93", width=1, tags="fly")
+            cv.create_line(*pts, fill="#e5533d", width=1, tags="fly")
         cx, cy = self._w2c(b.x, b.y)
         ux, uy = math.cos(b.heading), -math.sin(b.heading)          # heading on screen (+y is up on the map)
         px, py = -uy, ux
@@ -2924,10 +3159,24 @@ class FlyControllerApp:
     # VISION TAB: what each compound eye sees + the neck's gaze-stabilising actuation (optimal vs. actual)
     # ------------------------------------------------------------------
     def build_vision(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Label(bar, text="Smelling trigger:").pack(side=tk.LEFT)
+        for text, key in (("Left antenna", "l"), ("Right antenna", "r"), ("Both antennae", "lr")):
+            ttk.Button(bar, text=text, command=lambda k=key: self.trigger_smell(k)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar, text="Puff of odour ahead", command=self.puff_ahead).pack(side=tk.LEFT, padx=(14, 0))
+        ttk.Label(bar, text="(1.5 s test odour at the chosen antenna, or a burst released in front of the fly)", foreground="#666666").pack(side=tk.LEFT, padx=(10, 0))
         self.vision_canvas = tk.Canvas(parent, width=900, height=520, highlightthickness=0, bd=0, bg="#f0f0f0")
         self.vision_canvas.pack(fill=tk.BOTH, expand=True)
         self.vision_label = tk.Label(self.vision_canvas, bd=0, bg="#f0f0f0")
         self.vision_canvas.create_window(0, 0, window=self.vision_label, anchor="nw")
+    def trigger_smell(self, which):
+        t = time.perf_counter() + 1.5
+        for k in which:
+            self.odor_pulse[k] = t
+    def puff_ahead(self):
+        b = self.body
+        self.arena.plume.burst(b.x + math.cos(b.heading) * 6.0, b.y + math.sin(b.heading) * 6.0)
     @staticmethod
     def _eye_mosaic(gray, size):
         """Draw a greyscale camera image the way a compound eye samples it: one grey dot per ommatidium on a hex grid."""
@@ -2974,64 +3223,163 @@ class FlyControllerApp:
                 dx = dy = 0.0
             vals += [dx * deg_px / dt, -dy * deg_px / dt]       # + = image moves right / up
         self.eye_hist.append((now, vals[0], vals[1], vals[2], vals[3]))
+    def _plot(self, img, rect, title, series, hist_t, now, ylim, unit, hline=None, WIN=25.0):
+        """A light-themed line plot. series = [(values, bgr colour, label, thickness)], hist_t = sample times."""
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        ink, dim, grid = (20, 20, 20), (95, 95, 95), (215, 215, 215)
+        px0, py0, px1, py1 = rect
+        if px1 - px0 < 100 or py1 - py0 < 50:
+            return
+        (tw, _), _ = cv2.getTextSize(title, F, 0.5, 1)
+        cv2.putText(img, title, ((px0 + px1 - tw) // 2, py0 - 8), F, 0.5, ink, 1, cv2.LINE_AA)
+        cv2.rectangle(img, (px0, py0), (px1, py1), (255, 255, 255), -1)
+        lo, hi = ylim
+        ymap = lambda v: int(py1 - (max(lo, min(hi, v)) - lo) / (hi - lo) * (py1 - py0))
+        for k in range(5):
+            gv = lo + (hi - lo) * k / 4.0
+            cv2.line(img, (px0, ymap(gv)), (px1, ymap(gv)), (170, 170, 170) if abs(gv) < 1e-9 else grid, 1)
+            cv2.putText(img, (f"{gv:.0f}" if hi >= 20 else f"{gv:.2f}"), (px0 - 40, ymap(gv) + 4), F, 0.36, dim, 1, cv2.LINE_AA)
+        for k in range(6):
+            gx = int(px0 + (px1 - px0) * k / 5.0)
+            cv2.line(img, (gx, py0), (gx, py1), grid, 1)
+            cv2.putText(img, f"{-(25 - 5 * k):d}", (gx - 8, py1 + 15), F, 0.36, dim, 1, cv2.LINE_AA)
+        cv2.putText(img, "Time [s]", ((px0 + px1) // 2 - 26, py1 + 29), F, 0.4, dim, 1, cv2.LINE_AA)
+        cv2.putText(img, unit, (px0 - 40, py0 - 8), F, 0.36, dim, 1, cv2.LINE_AA)
+        cv2.rectangle(img, (px0, py0), (px1, py1), (170, 170, 170), 1)
+        if hline is not None:
+            y = ymap(hline)
+            for x in range(px0, px1, 10):
+                cv2.line(img, (x, y), (min(px1, x + 5), y), (120, 120, 120), 1)
+        for vals, col, label, th in series:
+            pts = []
+            for t, v in zip(hist_t, vals):
+                tt = t - now + WIN
+                if tt >= 0:
+                    pts.append((int(px0 + (px1 - px0) * tt / WIN), ymap(v)))
+            if len(pts) > 1:
+                cv2.polylines(img, [np.array(pts, np.int32)], False, col, th, cv2.LINE_AA)
+        lx = px1 - 215
+        for i, (vals, col, label, th) in enumerate(series):
+            cv2.line(img, (lx, py0 + 13 + 17 * i), (lx + 22, py0 + 13 + 17 * i), col, 2, cv2.LINE_AA)
+            cv2.putText(img, label, (lx + 28, py0 + 17 + 17 * i), F, 0.38, ink, 1, cv2.LINE_AA)
+    def _smell_diagram(self, img, x0, y0, w, h, cl, cr, head=None):
+        """The real 3-D head (front view) flattened to 2-D, with the smell organs highlighted and their odour numbers."""
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        ink, dim = (20, 20, 20), (95, 95, 95)
+        cv2.putText(img, "Smell receptors (head, front view)", (x0, y0 - 8), F, 0.5, ink, 1, cv2.LINE_AA)
+        cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (255, 255, 255), -1)
+        cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (170, 170, 170), 1)
+        vl, vr = min(1.0, cl / 0.4), min(1.0, cr / 0.4)
+        vp = 0.5 * (vl + vr) * 0.6                                # palps: the average, a bit weaker
+        cv2.putText(img, f"Left antenna  {cl:5.2f}", (x0 + 12, y0 + h - 56), F, 0.45, (200, 110, 30), 1, cv2.LINE_AA)
+        cv2.putText(img, f"Right antenna {cr:5.2f}", (x0 + 12, y0 + h - 38), F, 0.45, (30, 140, 230), 1, cv2.LINE_AA)
+        cv2.putText(img, f"Palps (est.)  {0.5 * (cl + cr) * 0.6:5.2f}", (x0 + 12, y0 + h - 20), F, 0.45, (60, 150, 60), 1, cv2.LINE_AA)
+        for i in range(70):                                       # colour bar: no odour -> strong
+            t = i / 69.0
+            c = tuple(int(u + (v - u) * t) for u, v in zip((225, 225, 225), (20, 120, 245)))
+            cv2.line(img, (x0 + w - 100 + i, y0 + h - 18), (x0 + w - 100 + i, y0 + h - 10), c, 1)
+        cv2.putText(img, "odour", (x0 + w - 100, y0 + h - 24), F, 0.36, dim, 1, cv2.LINE_AA)
+        if head is None:
+            cv2.putText(img, "(no 3-D head available)", (x0 + 20, y0 + h // 2), F, 0.45, dim, 1, cv2.LINE_AA)
+            return
+        rgb, body = head
+        ids = self.body.part_ids
+        ys, xs = np.nonzero(body >= 0)
+        if not len(xs):
+            return
+        pad = 14
+        bx0, bx1 = max(0, xs.min() - pad), min(body.shape[1], xs.max() + pad)
+        by0, by1 = max(0, ys.min() - pad), min(body.shape[0], ys.max() + pad)
+        rgb, body = rgb[by0:by1, bx0:bx1], body[by0:by1, bx0:bx1]
+        area_h = h - 70
+        sc = min((w - 20) / body.shape[1], area_h / body.shape[0])
+        tw, th = max(8, int(body.shape[1] * sc)), max(8, int(body.shape[0] * sc))
+        rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_AREA)
+        body = cv2.resize(body.astype(np.int16), (tw, th), interpolation=cv2.INTER_NEAREST)
+        lum = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        base = np.array([200, 205, 210], np.float32)              # flat light-grey head, shaded by the 3-D render
+        tile = np.empty((th, tw, 3), np.float32)
+        tile[:] = (base * (0.55 + 0.6 * lum[..., None])).clip(0, 255)
+        tile[body < 0] = 255
+        def lerp(v):
+            a = np.array([225, 225, 225], np.float32)
+            bb = np.array([20, 120, 245], np.float32)
+            return a + (bb - a) * max(0.0, min(1.0, v))
+        marks = []
+        for key, v, col, name in (("lant", vl, (200, 110, 30), "L"), ("rant", vr, (30, 140, 230), "R"), ("palp", vp, (60, 150, 60), "palps")):
+            m = np.isin(body, ids[key])
+            if not m.any():
+                continue
+            tile[m] = tile[m] * 0.35 + lerp(0.12 + 0.88 * v) * 0.65
+            cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            tile = np.ascontiguousarray(tile)
+            cv2.drawContours(tile, cnts, -1, col, 2, cv2.LINE_AA)
+            yy, xx = np.nonzero(m)
+            marks.append((key, name, col, int(xx.mean()), int(yy.mean()), v))
+        ox, oy = x0 + (w - tw) // 2, y0 + 8
+        out = tile.clip(0, 255).astype(np.uint8)
+        img[oy:oy + th, ox:ox + tw] = out
+        for key, name, col, mx, my, v in marks:
+            px, py = ox + mx, oy + my
+            if key in ("lant", "rant"):                      # label on the side where that antenna appears in the picture
+                lab = f"{'L' if key == 'lant' else 'R'} antenna {(cl if key == 'lant' else cr):.2f}"
+                lx = ox + 4 if mx < tw // 2 else ox + tw - 118
+                ly = oy + 12
+            else:
+                lab, lx, ly = f"palps {0.5 * (cl + cr) * 0.6:.2f}", ox + tw // 2 - 36, oy + th - 4
+            cv2.line(img, (px, py), (min(max(lx + 50, ox), ox + tw), ly + 3), col, 1, cv2.LINE_AA)
+            cv2.circle(img, (px, py), 3, col, -1, cv2.LINE_AA)
+            cv2.putText(img, lab, (lx, ly), F, 0.42, col, 1, cv2.LINE_AA)
     def render_vision(self, W, H, eyes=None):
-        bg, ink, dim, grid = (240, 240, 240), (20, 20, 20), (95, 95, 95), (215, 215, 215)
+        bg, ink, dim = (240, 240, 240), (20, 20, 20), (95, 95, 95)
         blue, orange = (200, 110, 30), (30, 140, 230)
         F = cv2.FONT_HERSHEY_SIMPLEX
         img = np.full((H, W, 3), bg, np.uint8)
-        cv2.putText(img, "Vision", (14, 26), F, 0.7, ink, 1, cv2.LINE_AA)
-        cv2.putText(img, "what each eye sees, and how fast that picture moves across it (optic flow)", (110, 26), F, 0.45, dim, 1, cv2.LINE_AA)
-        top, pad = 44, 12
-        rh = (H - top - pad * 2) // 2
-        side = int(min(rh - 36, W * 0.38))
+        cv2.putText(img, "Miscellaneous", (14, 22), F, 0.65, ink, 1, cv2.LINE_AA)
+        cv2.putText(img, "vision and smell", (150, 22), F, 0.45, dim, 1, cv2.LINE_AA)
+        top, pad = 52, 14
+        half = (H - top - pad) // 2
+        # ---------------- top half: eyes (right eye on the left of the left eye) + optic-flow graphs
+        side = int(max(80, min(half - 40, W * 0.235)))
+        ey = top + 22
+        for i, (name, key) in enumerate((("Right eye raw vision", 1), ("Left eye raw vision", 0))):
+            ex = 14 + i * (side + 14)
+            cv2.putText(img, name, (ex, ey - 6), F, 0.45, ink, 1, cv2.LINE_AA)
+            img[ey:ey + side, ex:ex + side] = self._eye_mosaic(eyes[key] if eyes else None, side)
+            cv2.rectangle(img, (ex, ey), (ex + side, ey + side), (205, 205, 205), 1)
+        gx0 = 14 + 2 * side + 14 + 62
+        gx1 = W - 24
         hist = list(self.eye_hist)
-        now = hist[-1][0] if hist else 0.0
-        WIN = 6.0
-        for row, (name, key) in enumerate((("Left eye raw vision", 0), ("Right eye raw vision", 1))):
-            y0 = top + row * (rh + pad)
-            cv2.putText(img, name, (14, y0 + 18), F, 0.55, ink, 1, cv2.LINE_AA)
-            tile = self._eye_mosaic(eyes[key] if eyes else None, side)
-            img[y0 + 28:y0 + 28 + side, 14:14 + side] = tile
-            cv2.rectangle(img, (14, y0 + 28), (14 + side, y0 + 28 + side), (205, 205, 205), 1)
-            # ---- image-motion plot of this eye (horizontal + vertical optic flow)
-            hi, vi = (1, 2) if row == 0 else (3, 4)
-            px0, px1 = 14 + side + 70, W - 24
-            py0, py1 = y0 + 34, y0 + rh - 34
-            if px1 - px0 < 120 or py1 - py0 < 60:
-                continue
-            title = "Image motion (optic flow)"
-            (tw, _), _ = cv2.getTextSize(title, F, 0.55, 1)
-            cv2.putText(img, title, ((px0 + px1 - tw) // 2, y0 + 18), F, 0.55, ink, 1, cv2.LINE_AA)
-            cv2.rectangle(img, (px0, py0), (px1, py1), (255, 255, 255), -1)
-            peak = max([abs(h[hi]) for h in hist] + [abs(h[vi]) for h in hist] + [10.0])
-            YR = float(np.ceil(peak * 1.15 / 10.0) * 10.0)
-            ymap = lambda v: int(py1 - (max(-YR, min(YR, v)) + YR) / (2 * YR) * (py1 - py0))
-            for gv in (-YR, -YR / 2, 0, YR / 2, YR):
-                cv2.line(img, (px0, ymap(gv)), (px1, ymap(gv)), grid if gv else (170, 170, 170), 1)
-                cv2.putText(img, f"{gv:.0f}", (px0 - 38, ymap(gv) + 4), F, 0.38, dim, 1, cv2.LINE_AA)
-            for k in range(0, 7):
-                gx = int(px0 + (px1 - px0) * k / 6.0)
-                cv2.line(img, (gx, py0), (gx, py1), grid, 1)
-                cv2.putText(img, f"{-(6 - k):d}", (gx - 8, py1 + 16), F, 0.38, dim, 1, cv2.LINE_AA)
-            cv2.putText(img, "Time [s]", ((px0 + px1) // 2 - 28, py1 + 30), F, 0.42, dim, 1, cv2.LINE_AA)
-            cv2.putText(img, "deg/s", (px0 - 38, py0 - 14), F, 0.38, dim, 1, cv2.LINE_AA)
-            cv2.rectangle(img, (px0, py0), (px1, py1), (170, 170, 170), 1)
-            pts_h, pts_v = [], []
-            for h in hist:
-                t = h[0] - now + WIN
-                if t < 0:
-                    continue
-                x = int(px0 + (px1 - px0) * t / WIN)
-                pts_h.append((x, ymap(h[hi])))
-                pts_v.append((x, ymap(h[vi])))
-            if len(pts_h) > 1:
-                cv2.polylines(img, [np.array(pts_h, np.int32)], False, blue, 2, cv2.LINE_AA)
-                cv2.polylines(img, [np.array(pts_v, np.int32)], False, orange, 2, cv2.LINE_AA)
-            lx = px1 - 230
-            cv2.line(img, (lx, py0 + 14), (lx + 22, py0 + 14), blue, 2, cv2.LINE_AA)
-            cv2.putText(img, "Horizontal (+ = to the right)", (lx + 28, py0 + 18), F, 0.4, ink, 1, cv2.LINE_AA)
-            cv2.line(img, (lx, py0 + 32), (lx + 22, py0 + 32), orange, 2, cv2.LINE_AA)
-            cv2.putText(img, "Vertical (+ = up)", (lx + 28, py0 + 36), F, 0.4, ink, 1, cv2.LINE_AA)
+        now = time.perf_counter()
+        ht = [h[0] for h in hist]
+        gh = (half - 12) // 2 - 56
+        for row, (name, hi, vi) in enumerate((("Right eye - image motion (optic flow)", 3, 4), ("Left eye - image motion (optic flow)", 1, 2))):
+            py0 = top + 24 + row * (gh + 56)
+            vals = [abs(h[hi]) for h in hist] + [abs(h[vi]) for h in hist] + [10.0]
+            YR = float(np.ceil(max(vals) * 1.15 / 10.0) * 10.0)
+            self._plot(img, (gx0, py0, gx1, py0 + gh), name,
+                       [([h[hi] for h in hist], blue, "Horizontal (+ = right)", 2), ([h[vi] for h in hist], orange, "Vertical (+ = up)", 2)],
+                       ht, now, (-YR, YR), "deg/s")
+        # ---------------- bottom half: smell receptor diagram + odour graphs
+        y0 = top + half + 24
+        hh = H - y0 - 14
+        dw = int(min(W * 0.30, hh * 1.1))
+        cl, cr = self.odor_now
+        head = self.body.render_head() if getattr(self.body, 'renderer', None) is not None else None
+        self._smell_diagram(img, 14, y0 + 24, dw, hh - 24, cl, cr, head)
+        oh = list(self.odor_hist)
+        ot = [h[0] for h in oh]
+        qx0, qx1 = 14 + dw + 62, W - 24
+        gh2 = (hh - 12) // 2 - 56
+        top_c = max([h[1] for h in oh] + [h[2] for h in oh] + [0.4])
+        yc = float(np.ceil(top_c * 1.15 * 10.0) / 10.0)
+        self._plot(img, (qx0, y0 + 24, qx1, y0 + 24 + gh2), "Odour at the antennae",
+                   [([h[1] for h in oh], blue, "Left antenna", 2), ([h[2] for h in oh], orange, "Right antenna", 2)],
+                   ot, now, (0.0, yc), "conc.", hline=OdorTracker.THR)
+        dd = [(h[1] - h[2]) for h in oh]
+        yd = float(np.ceil(max([abs(v) for v in dd] + [0.2]) * 1.15 * 10.0) / 10.0)
+        self._plot(img, (qx0, y0 + 24 + gh2 + 56, qx1, y0 + 24 + 2 * gh2 + 56), "Left - right odour (steering cue)",
+                   [(dd, (60, 140, 60), "Left minus right", 2)], ot, now, (-yd, yd), "conc.")
         return img
     def draw_vision(self):
         W = max(700, self.vision_canvas.winfo_width() - 2)
