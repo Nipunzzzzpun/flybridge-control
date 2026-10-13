@@ -321,7 +321,7 @@ AVOID_RANGE = 6.0          # mm, how far ahead it "sees" obstacles and walls
 EAT_RANGE = 1.6            # mm
 EAT_SECONDS = 4.0          # how long one food pellet takes to eat
 ODOR_PULSE = 0.35                                      # concentration a test pulse adds at an antenna
-SMELL_PLUME, SMELL_RADIUS = "Plume (fluid dynamics)", "Radius (instant)"
+SMELL_PLUME, SMELL_RADIUS = "Plume (fluid dynamics)", "Radius (Deprecated)"
 ENV_RATE_HZ = 600.0        # Poisson rate on a descending-neuron group at full command
 UP_POOL = 120              # strongest upstream (premotor) neurons per DN group that carry the command into the network
 POP_REF = 0.0025           # population rate (spikes per neuron per ms, = 2.5 Hz) above which global inhibition damps the synapses
@@ -1921,6 +1921,7 @@ class FlyControllerApp:
         tab_build = ttk.Frame(self.nb)
         tab_setup = ttk.Frame(self.nb)
         self.nb.add(tab_ctrl, text="   Control Panel   ")
+        self.tab_ctrl = tab_ctrl
         self.nb.add(tab_build, text="   Build (obstacles & food)   ")
         self.nb.add(tab_setup, text="   MaleCNS Setup   ")
         tab_motor = ttk.Frame(self.nb)
@@ -2664,10 +2665,18 @@ class FlyControllerApp:
             threading.Thread(target=self.tap, args=(self.food_key,), daemon=True).start()   # one tap per pellet eaten
         self.food_seen = eaten
         self.frame_i = getattr(self, "frame_i", 0) + 1
+        try:
+            sel = self.nb.select()                         # draw only the page that is open (the others cost time and are invisible)
+        except Exception:
+            sel = str(self.tab_ctrl)
         if self.frame_i % 3 == 0:
             self.update_arena_view()
-        self.set_image(self.body_label, self.body.render(VIEW_W, VIEW_H))
-        self.set_image(self.cloud_label, self.render_cloud())
+        on_ctrl = sel == str(self.tab_ctrl)
+        prime = not getattr(self, "_primed", False)            # first frame: draw every page once so the window knows its full size
+        self._primed = True
+        if on_ctrl or prime:
+            self.set_image(self.body_label, self.body.render(VIEW_W, VIEW_H))
+            self.set_image(self.cloud_label, self.render_cloud())
         self.status.set(
             f"t {self.sim.t_ms / 1000:6.1f}s  speed {self.sim.speed:4.2f}x  "
             f"spikes/s {self.sim.spikes_per_s:7.0f}  painted {int(self.stim_mask.sum())}\n"
@@ -2678,7 +2687,7 @@ class FlyControllerApp:
         self._spk_prev = n_spk
         self.hist.append((now, rate, max(fwd, back, left, right), (time.perf_counter() - t_start) * 1000.0,
                           self.last_motion[0], self.last_motion[1]))
-        if self.graph_win is not None and self.frame_i % 2 == 0:
+        if self.graph_win is not None and ((self.frame_i % 2 == 0 and on_ctrl) or prime):
             self.draw_graphs()
         if self.frame_i % 3 == 2:
             try:
@@ -2703,7 +2712,7 @@ class FlyControllerApp:
         side = ttk.Frame(parent)
         side.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         ttk.Label(side, text="Build the fly's world", font=("Arial", 12, "bold")).pack(anchor=tk.W)
-        ttk.Label(side, wraplength=210, justify=tk.LEFT, text=(
+        ttk.Label(side, wraplength=190, justify=tk.LEFT, text=(
             "Click on the map to place things. In 'Dynamic environment' mode the fly wanders on its own, "
             "smells food, steers around obstacles and walls, and stops to eat.")).pack(anchor=tk.W, pady=(4, 10))
         self.build_tool = tk.StringVar(value="obstacle")
@@ -2713,7 +2722,12 @@ class FlyControllerApp:
         self.make_slider(side, "Obstacle size (mm)", self.obst_r_var, 1.5, 9.0, "{:.1f}", label_w=17)
         self.smell_model = tk.StringVar(value=SMELL_PLUME)
         ttk.Label(side, text="Smell model").pack(anchor=tk.W, pady=(6, 0))
-        ttk.Combobox(side, textvariable=self.smell_model, state="readonly", values=(SMELL_PLUME, SMELL_RADIUS), width=24).pack(anchor=tk.W)
+        mb = ttk.Menubutton(side, textvariable=self.smell_model, width=24)
+        mn = tk.Menu(mb, tearoff=0)
+        mn.add_radiobutton(label=SMELL_PLUME, variable=self.smell_model, value=SMELL_PLUME)
+        mn.add_radiobutton(label=SMELL_RADIUS + " - not available", variable=self.smell_model, value=SMELL_RADIUS, state="disabled")
+        mb["menu"] = mn
+        mb.pack(anchor=tk.W)
         self.wind_speed_var = tk.DoubleVar(value=8.0)
         self.wind_dir_var = tk.DoubleVar(value=0.0)
         self.make_slider(side, "Wind speed (mm/s)", self.wind_speed_var, 0.0, 25.0, "{:.0f}", label_w=17)
@@ -2725,6 +2739,20 @@ class FlyControllerApp:
         ttk.Button(side, text="Default layout", command=self.arena.default_layout).pack(fill=tk.X, pady=2)
         self.arena_info = tk.StringVar(value="")
         ttk.Label(side, textvariable=self.arena_info, justify=tk.LEFT).pack(anchor=tk.W, pady=(12, 0))
+        panel_bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        # bottom: live wind compass (black = direction, blue = velocity), fills the free space
+        self.wind_canvas = tk.Canvas(side, width=270, height=280, bg=panel_bg, highlightthickness=0, bd=0)
+        self.wind_canvas.pack(side=tk.BOTTOM, anchor=tk.W, pady=(8, 0))
+        # column between the sidebar and the arena: Individualized Simulation = close-up of the live odour plume with numbers
+        lf = ttk.LabelFrame(parent, text="Individualized Simulation")
+        lf.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        self.wsim_label = tk.Label(lf, bd=0, bg="#10181a")
+        self.wsim_label.pack(padx=6, pady=(2, 4))
+        self.wsim_paused = False
+        self.wsim_label.bind("<Button-1>", self.wsim_click)         # the pause / clear icons are drawn into the picture itself
+        self.wsim_label.bind("<Motion>", self.wsim_hover)
+        self.wsim_info = tk.StringVar(value="")
+        ttk.Label(lf, textvariable=self.wsim_info, justify=tk.LEFT, font=("Consolas", 9)).pack(anchor=tk.W, padx=8, pady=(0, 6))
         self.arena_px = ARENA_PX
         holder = ttk.Frame(parent)                         # the arena grows to fill all the free space, staying square
         holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2810,6 +2838,150 @@ class FlyControllerApp:
             rx, ry = self.arena.resolve(x, y)
             self.body.teleport(rx, ry)
             self.trail = []
+    def draw_gauges(self):
+        """Wind compass on the Build tab: small black arrow = wind direction, thinner blue arrow = velocity (length scales with speed)."""
+        wc = getattr(self, "wind_canvas", None)
+        if wc is None:
+            return
+        wc.delete("all")
+        speed = float(self.wind_speed_var.get()) if hasattr(self, "wind_speed_var") else 0.0
+        th = getattr(self.arena.plume, "wind_dir", 0.0)
+        ox, oy, r = 135, 168, 82
+        wc.create_text(4, 4, anchor="nw", text="Wind", font=("Arial", 10, "bold"))
+        wc.create_text(4, 20, anchor="nw", text=f"{speed:.0f} mm/s   {math.degrees(th) % 360:.0f} deg", font=("Arial", 9, "bold"))
+        wc.create_text(4, 35, anchor="nw", text="black = direction\nblue = velocity", font=("Arial", 8), fill="#555555")
+        wc.create_oval(ox - r, oy - r, ox + r, oy + r, outline="#888888", width=2)
+        wc.create_oval(ox - r * 0.5, oy - r * 0.5, ox + r * 0.5, oy + r * 0.5, outline="#cccccc")
+        for k in range(0, 360, 30):
+            a = math.radians(k)
+            l = 9 if k % 90 == 0 else 5
+            wc.create_line(ox + (r - l) * math.cos(a), oy - (r - l) * math.sin(a), ox + r * math.cos(a), oy - r * math.sin(a), fill="#888888")
+        for lab, dx, dy in (("N", 0, -1), ("E", 1, 0), ("S", 0, 1), ("W", -1, 0)):
+            wc.create_text(ox + dx * (r + 14), oy + dy * (r + 12), text=lab, font=("Arial", 10, "bold"), fill="#555555")
+        c, sn = math.cos(th), math.sin(th)          # arrows point where the wind blows TO (map: +y is up)
+        L = r * 0.95 * min(1.0, speed / 25.0)
+        if L > 2:
+            wc.create_line(ox - c * 6, oy + sn * 6, ox + c * L, oy - sn * L, fill="#1f6fb2", width=2, arrow=tk.LAST, arrowshape=(10, 12, 4))
+        wc.create_line(ox - c * 14, oy + sn * 14, ox + c * 30, oy - sn * 30, fill="#000000", width=4, arrow=tk.LAST, arrowshape=(10, 12, 5))
+        wc.create_oval(ox - 3, oy - 3, ox + 3, oy + 3, fill="#000000")
+        self._wk = getattr(self, "_wk", 0) + 1
+        if self._wk % 2 == 0:
+            self.draw_wind_sim()
+    def wsim_toggle(self):
+        self.wsim_paused = not self.wsim_paused
+        self._wsim_force = True
+    def _wsim_hit(self, e):
+        W, H = 300, getattr(self, "_wsim_H", 520)
+        if H - 40 <= e.y <= H - 8:
+            if W - 62 <= e.x <= W - 38:
+                return "pause"
+            if W - 32 <= e.x <= W - 8:
+                return "clear"
+        return None
+    def wsim_click(self, e):
+        hit = self._wsim_hit(e)
+        if hit == "pause":
+            self.wsim_toggle()
+        elif hit == "clear":
+            self.wsim_clear()
+    def wsim_hover(self, e):
+        try:
+            self.wsim_label.configure(cursor="hand2" if self._wsim_hit(e) else "")
+        except Exception:
+            pass
+    def wsim_clear(self):
+        wp = getattr(self, "_wp", None)
+        if wp is not None:
+            wp.clear()
+        self._wsim_force = True
+    def draw_wind_sim(self):
+        """Individualized Simulation: an 'item viewer' for ONE odour source. A single pellet emits into a tall wind tunnel (wind drawn blowing down the screen
+        at the real wind speed), so you can see how the fluid carries, snakes and thins the odour before placing food on the map."""
+        lab = getattr(self, "wsim_label", None)
+        if lab is None:
+            return
+        W, XH = 300, 30.0                                      # image width px, half-width of the view in mm  (5 px per mm)
+        PX = W / (2 * XH)
+        H = 520
+        try:
+            hh = int(lab.master.winfo_height())
+            if hh > 300:
+                H = int(min(800, max(300, hh - 225)))
+        except Exception:
+            pass
+        YH = XH * H / W                                        # half-height of the view in mm (<= 80)
+        sp = float(self.wind_speed_var.get()) if hasattr(self, "wind_speed_var") else 0.0
+        paused = getattr(self, "wsim_paused", False)
+        if paused and not getattr(self, "_wsim_force", False) and getattr(self, "_wsim_drawn", False):
+            return                                              # frozen: keep the last picture
+        self._wsim_force = False
+        self._wsim_drawn = True
+        ys = YH - 6.0                                          # the source sits near the top; the wind blows downwards
+        wp = getattr(self, "_wp", None)
+        if wp is None or abs(wp.half - 80.0) > 1e-6:
+            wp = self._wp = Plume(80.0)
+            wp.rng = np.random.default_rng(11)
+            self._wp_t = time.monotonic()
+            for _ in range(160):
+                wp.update(0.1, [(0.0, ys, 1.0)], sp, 270.0)
+        now = time.monotonic()
+        dt = min(0.2, max(0.0, now - getattr(self, "_wp_t", now)))
+        self._wp_t = now
+        if not paused:
+            for _ in range(2):
+                wp.update(dt / 2.0, [(0.0, ys, 1.0)], sp, 270.0)
+        gx, gy = int(2 * XH / 0.5), int(2 * YH / 0.5)
+        img = np.zeros((gy, gx), np.float32)
+        if len(wp.age):
+            w = 0.25 * np.exp(-wp.age / 18.0)
+            Hh, _, _ = np.histogram2d(wp.pos[:, 1], wp.pos[:, 0], bins=[gy, gx], range=[[-YH, YH], [-XH, XH]], weights=w)
+            img = cv2.GaussianBlur(Hh[::-1].astype(np.float32), (0, 0), 0.7)
+        v8 = (np.clip(1.0 - np.exp(-2.2 * img), 0, 1) * 255).astype(np.uint8)
+        big = cv2.resize(cv2.applyColorMap(v8, cv2.COLORMAP_INFERNO), (W, H), interpolation=cv2.INTER_LINEAR)
+        big[cv2.resize(v8, (W, H), interpolation=cv2.INTER_NEAREST) < 4] = (26, 24, 16)
+        px = lambda x, y: (int((x + XH) * PX), int((YH - y) * PX))
+        for d in range(10, int(2 * YH), 10):                    # distance-from-source rings every 10 mm
+            y = ys - d
+            if y < -YH:
+                break
+            cv2.line(big, px(-XH, y), px(XH, y), (60, 52, 40), 1)
+            cv2.putText(big, f"{d} mm", (4, px(0, y)[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (170, 170, 170), 1, cv2.LINE_AA)
+        cv2.line(big, px(0, YH), px(0, -YH), (60, 52, 40), 1)
+        cv2.circle(big, px(0, ys), 6, (31, 140, 240), -1, cv2.LINE_AA)
+        cv2.circle(big, px(0, ys), 9, (110, 190, 255), 1, cv2.LINE_AA)
+        cv2.putText(big, "source", (px(0, ys)[0] + 13, px(0, ys)[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (110, 190, 255), 1, cv2.LINE_AA)
+        self._wsim_H = H
+        ic = (235, 238, 240)                                    # icons drawn straight into the picture: pause / play and clear
+        cy0 = H - 24
+        px0 = W - 50
+        if paused:
+            cv2.fillPoly(big, [np.array([[px0 - 5, cy0 - 7], [px0 - 5, cy0 + 7], [px0 + 7, cy0]], np.int32)], ic, cv2.LINE_AA)
+        else:
+            cv2.rectangle(big, (px0 - 5, cy0 - 7), (px0 - 2, cy0 + 7), ic, -1)
+            cv2.rectangle(big, (px0 + 2, cy0 - 7), (px0 + 5, cy0 + 7), ic, -1)
+        cx0 = W - 20
+        cv2.line(big, (cx0 - 6, cy0 - 6), (cx0 + 6, cy0 + 6), ic, 2, cv2.LINE_AA)
+        cv2.line(big, (cx0 - 6, cy0 + 6), (cx0 + 6, cy0 - 6), ic, 2, cv2.LINE_AA)
+        bar = int(10 * PX)
+        cv2.rectangle(big, (10, H - 18), (10 + bar, H - 13), (255, 255, 255), -1)
+        cv2.putText(big, "10 mm", (10, H - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1, cv2.LINE_AA)
+        self.set_image(lab, big)
+        thr = OdorTracker.THR
+        c = wp.conc([(0.0, ys - d) for d in (10.0, 20.0, 40.0)])
+        age = float(wp.age.mean()) if len(wp.age) else 0.0
+        reach = float(ys - wp.pos[:, 1].min()) if len(wp.age) else 0.0
+        sel = wp.pos[(wp.pos[:, 1] < ys - 20) & (wp.pos[:, 1] > ys - 30)] if len(wp.age) else np.zeros((0, 2))
+        wid = float(sel[:, 0].std() * 2) if len(sel) > 5 else 0.0
+        mark = lambda x: "smelled" if x > thr else "faint"
+        self.wsim_info.set(
+            f"wind speed   {sp:5.1f} mm/s  (shown downward)\n"
+            f"map wind dir {float(self.wind_dir_var.get()) if hasattr(self, 'wind_dir_var') else 0.0:5.0f} deg\n"
+            f"filaments    {len(wp.age):5d}   mean age {age:4.1f} s\n"
+            f"plume reach  {reach:5.1f} mm   width@25mm {wid:4.1f} mm\n"
+            f"odour  10 mm {c[0]:5.3f}  {mark(c[0])}\n"
+            f"odour  20 mm {c[1]:5.3f}  {mark(c[1])}\n"
+            f"odour  40 mm {c[2]:5.3f}  {mark(c[2])}\n"
+            f"detect threshold {thr:.2f}")
     def plume_overlay(self):
         """Grey smoke picture of the odour plume, drawn over the map (like a smoke-plume visualisation)."""
         n = int(self.arena_px)
@@ -2851,12 +3023,15 @@ class FlyControllerApp:
         if not self.trail or math.hypot(b.x - self.trail[-1][0], b.y - self.trail[-1][1]) > 0.6:
             self.trail.append((b.x, b.y))
             self.trail = self.trail[-250:]
-        cv.delete("smell")
-        cv.delete("plume")
         try:
             on_build = self.nb.select() == str(self.tab_build)
         except Exception:
             on_build = True
+        if not on_build and getattr(self, "_arena_primed", False):
+            return                                          # map page is hidden: skip all drawing
+        self._arena_primed = True
+        cv.delete("smell")
+        cv.delete("plume")
         if on_build and self.smell_model.get() == SMELL_PLUME and len(self.arena.plume.age):
             img = self.plume_overlay()
             if img is not None:
@@ -2877,6 +3052,7 @@ class FlyControllerApp:
         L, Wd = 3.2 * sc, 1.5 * sc
         cv.create_polygon(cx + ux * L, cy + uy * L, cx - ux * L * 0.6 + px * Wd, cy - uy * L * 0.6 + py * Wd,
                           cx - ux * L * 0.6 - px * Wd, cy - uy * L * 0.6 - py * Wd, fill="#e7b44c", outline="#fff3d0", tags="fly")
+        self.draw_gauges()
         self.arena_info.set(f"Food eaten: {self.arena.eaten}\nFood left: {len(self.arena.foods)}\nObstacles: {len(self.arena.obstacles)}\n"
                             f"Fly at x {b.x:5.1f}  y {b.y:5.1f} mm")
     # ------------------------------------------------------------------
