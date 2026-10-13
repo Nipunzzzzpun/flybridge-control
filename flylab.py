@@ -4037,7 +4037,7 @@ class FlyControllerApp:
             fill = "#a52215" if state["down"] else ("#b82819" if state["over"] else "#c42b1c")
             x0, y0, x1, y1, r = 1, 1, w - 1, h - 1, 4
             cv.create_polygon(x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
-                              smooth=True, fill=fill, outline="#8f1c11")
+                              smooth=True, fill=fill, outline=fill)
             cv.create_text(w / 2.0, h / 2.0, text=text, fill="#ffffff", font=font)
         def press(_e):
             state["down"] = True
