@@ -21,7 +21,7 @@ In the app:  Control Panel = live brain + NeuroMechFly body (drag the fly to rot
 Template alignment (optional, navis transforms tutorial):  python -m pip install navis flybrains h5py
 """
 from collections import deque
-import random, ctypes, os, sys, json, time, threading, base64, math, re, queue, warnings, textwrap
+import collections, random, ctypes, os, sys, json, time, threading, base64, math, re, queue, warnings, textwrap
 # Make Windows report real pixels to everything (Tk, screen capture, clicks) so coordinates all agree.
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -315,7 +315,7 @@ class LIFSim:
 # PART 1b - WORLD (arena with obstacles and food) + wandering + input sets
 # =====================================================================
 ARENA_HALF = 40.0          # mm; the arena is 80 x 80 mm
-FLY_R = 0.9                # mm, body radius used for collisions
+FLY_R = 1.4                # mm, body radius used for collisions
 FOOD_RANGE = 22.0          # mm, how far the fly "smells" food
 AVOID_RANGE = 6.0          # mm, how far ahead it "sees" obstacles and walls
 EAT_RANGE = 1.6            # mm
@@ -950,8 +950,9 @@ SPAWN_GROUND_X, SPAWN_GROUND_Y = 1430, 420
 GAME_MODES = ["Classic", "Gold Quest"]
 BLOOKET_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_blooket_map.json")
 MAP_STEPS = [("1", "ANSWER 1"), ("2", "ANSWER 2"), ("3", "ANSWER 3"), ("4", "ANSWER 4"), ("continue", "the CONTINUE / SUBMIT button")]
+EYE_PX, EYE_FOV, EYE_YAW = 120, 110.0, 35.0                  # eye camera resolution (px), field of view (deg), outward turn of each eye (deg)
 MOTOR_W = 860                                             # width of the Motor Properties picture
-MINI_W, MINI_H = 660, 320                                  # window size on the "Minimized" page
+MINI_W, MINI_H = 790, 320                                  # window size on the "Minimized" page
 FOOD_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_food_key.json")
 def load_food_key():
     try:
@@ -1051,10 +1052,13 @@ class NeuroMechFlyBody:
     LEG_NAMES = {"lf": "Left front leg", "lm": "Left middle leg", "lh": "Left hind leg",
                  "rf": "Right front leg", "rm": "Right middle leg", "rh": "Right hind leg"}
     TRIPOD = {"lf": 0.0, "rm": 0.0, "lh": 0.0, "rf": 0.5, "lm": 0.5, "rh": 0.5}
-    HIND_LIFT = 3.0                                # the heavy hind legs need a higher swing to really clear the ground
-    STEPMAX, LIFT, STANCE = 1.0, 0.35, 0.6       # mm of foot travel per step, mm foot lift, fraction of the cycle on the ground
+    GAZE_STAB, NECK_MAX, NECK_TAU = 1.0, math.radians(30.0), 0.06     # neck reflex gain / limit (rad) / lag (s)
+    NECK_SIGN = {"roll": 1.0, "pitch": 1.0}
+    _neck_dt = 0.004
+    HIND_LIFT = 2.2                                # the heavy hind legs need a higher swing to really clear the ground
+    STEPMAX, LIFT, STANCE = 2.4, 0.25, 0.7       # mm of foot travel per step, mm foot lift, fraction of the cycle on the ground
     V_MAX, W_MAX = 22.0, 4.5                     # commanded mm/s and rad/s at full drive (feet slip, so real motion is lower)
-    F_MAX, F_MIN = 16.0, 6.0                     # Hz, step frequency limits while walking
+    F_MAX, F_MIN = 5.0, 2.5                       # Hz, step frequency limits while walking
     KP, ADHESION = 50.0, 3.0                    # joint motor stiffness, foot adhesion gain
     EFF_V, EFF_W = 0.30, 0.22                    # how much of the commanded walk / turn the body is expected to achieve
     YAW_ASSIST = 0.0                             # 0..1: how strongly a gyro-like yaw-rate reflex trims the turning (0 = legs only)
@@ -1216,11 +1220,29 @@ class NeuroMechFlyBody:
         self.cam_default = (135.0, -25.0, dist if dist > 1e-6 else 4.0)
         self.view_reset()
         self.renderer = mj.Renderer(m, height=self.h, width=self.w)
+        # --- vision: one small camera renderer shared by both compound eyes, and the neck joints used for gaze stabilisation
+        self.eye_renderer = mj.Renderer(m, height=EYE_PX, width=EYE_PX)
+        self.head_body = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "nmf/c_head")
+        self.eye_body = {"l": mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "nmf/l_eye"), "r": mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "nmf/r_eye")}
+        self.neck_adr = {}
+        for ax in ("roll", "pitch"):
+            jj = mj.mj_name2id(m, mj.mjtObj.mjOBJ_JOINT, f"nmf/c_thorax-c_head-{ax}")
+            self.neck_adr[ax] = int(m.jnt_qposadr[jj]) if jj >= 0 else -1
+        self._in_head = np.zeros(m.nbody, bool)
+        for bi in range(m.nbody):
+            k = bi
+            while k > 0:
+                if k == self.head_body:
+                    self._in_head[bi] = True
+                    break
+                k = int(m.body_parentid[k])
+        self.neck_cmd = {"roll": 0.0, "pitch": 0.0}
+        self.neck_opt = {"roll": 0.0, "pitch": 0.0}
         self.reset()
 
-    def _draw_arena(self):
+    def _draw_arena(self, rend=None, for_eye=False):
         """Add walls, obstacles and food to the rendered scene (visual only; collisions are handled in step)."""
-        sc, mj = self.renderer.scene, self.mj
+        sc, mj = (rend or self.renderer).scene, self.mj
         eye = np.eye(3).ravel()
         def add(kind, size, pos, rgba):
             if sc.ngeom >= sc.maxgeom:
@@ -1230,16 +1252,19 @@ class NeuroMechFlyBody:
             sc.ngeom += 1
         if self.arena is not None:
             hf = self.arena.half
-            wall = (0.55, 0.55, 0.6, 1.0)
-            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, hf, 0.6], wall)
-            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, -hf, 0.6], wall)
-            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [hf, 0, 0.6], wall)
-            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [-hf, 0, 0.6], wall)
+            wall = (0.55, 0.55, 0.62, 0.22)       # see-through, so the camera outside the arena never hides the fly
+            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, hf + 0.3, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [hf, 0.3, 0.6], [0, -hf - 0.3, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [hf + 0.3, 0, 0.6], wall)
+            add(mj.mjtGeom.mjGEOM_BOX, [0.3, hf, 0.6], [-hf - 0.3, 0, 0.6], wall)
             for ox, oy, r in self.arena.obstacles:
                 add(mj.mjtGeom.mjGEOM_CYLINDER, [r, 1.6, 0], [ox, oy, 1.6], (0.45, 0.5, 0.62, 1.0))
             for fx, fy, amt in self.arena.foods:
                 r = 0.25 + 0.45 * max(0.0, min(1.0, amt))
-                add(mj.mjtGeom.mjGEOM_SPHERE, [r, 0, 0], [fx, fy, r], (0.95, 0.55, 0.12, 1.0))
+                if for_eye:                                     # bigger + brighter in the eyes' greyscale view so food stands out
+                    add(mj.mjtGeom.mjGEOM_SPHERE, [r * 1.8, 0, 0], [fx, fy, r * 1.8], (1.0, 0.9, 0.45, 1.0))
+                else:
+                    add(mj.mjtGeom.mjGEOM_SPHERE, [r, 0, 0], [fx, fy, r], (0.95, 0.55, 0.12, 1.0))
         for p, f in (): # (contact arrows removed)                       # ground-contact force arrows (magenta), like neuromechfly.org
             L = float(np.linalg.norm(f))
             if L < 1e-6 or sc.ngeom >= sc.maxgeom:
@@ -1399,6 +1424,15 @@ class NeuroMechFlyBody:
                 d.ctrl[self.adh[leg]] = 0.0 if (swing or (gr > 0.5 and leg in ("lf", "rf"))) else 1.0
         if self.prob_adr.size:
             self.ik.qpos[self.prob_adr] = self.FEED_ANGLES[: self.prob_adr.size] * float(min(1.0, max(0.0, self.feed)))
+        if self.GAZE_STAB > 0.0:                                    # neck reflex: counter-rotate the head against the body's roll / pitch
+            for ax, ang in (("roll", self.roll), ("pitch", self.pitch)):
+                adr = self.neck_adr.get(ax, -1)
+                if adr < 0:
+                    continue
+                opt = float(np.clip(-self.NECK_SIGN[ax] * ang * self.GAZE_STAB, -self.NECK_MAX, self.NECK_MAX))
+                self.neck_opt[ax] = opt
+                self.neck_cmd[ax] += (opt - self.neck_cmd[ax]) * min(1.0, self._neck_dt / self.NECK_TAU)
+                self.ik.qpos[adr] = self.q_neutral[adr] + self.neck_cmd[ax]
         self.target = self.ik.qpos[self.act_q].copy()
         d.ctrl[self.pos_act] = self.target
 
@@ -1450,6 +1484,7 @@ class NeuroMechFlyBody:
             cdt = c * self.PHYS_DT
             self.phase = (self.phase + f * cdt) % 1.0
             self._groom_t += cdt
+            self._neck_dt = cdt
             self._apply_gait(vs, f, scale, gr)
             if self.YAW_ASSIST > 0.0 and self.upright > 0.5:   # gyro-like turning reflex (PI on the yaw rate)
                 self._wf += min(1.0, cdt / 0.05) * (float(d.qvel[5]) - self._wf)
@@ -1523,7 +1558,67 @@ class NeuroMechFlyBody:
             cv2.putText(img, str(exc)[:52], (12, h // 2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (90, 90, 90), 1, cv2.LINE_AA)
             return img
 
+    def neck_state(self):
+        """(optimal roll, optimal pitch, actual roll, actual pitch) of the neck in degrees."""
+        d = self.data
+        out = []
+        for ax in ("roll", "pitch"):
+            out.append(math.degrees(self.neck_opt[ax]))
+        for ax in ("roll", "pitch"):
+            adr = self.neck_adr.get(ax, -1)
+            out.append(math.degrees(float(d.qpos[adr] - self.q_neutral[adr])) if adr >= 0 else 0.0)
+        return tuple(out)
+    def render_eyes(self):
+        """Raw (greyscale) view of each compound eye, rendered from the head. Returns (left, right) uint8 arrays, or None."""
+        if self.renderer is None or getattr(self, "eye_renderer", None) is None or self.head_body < 0:
+            return None
+        mj, m, d = self.mj, self.model, self.data
+        hm = d.xmat[self.head_body].reshape(3, 3)
+        fwd, up = hm[:, 0], hm[:, 2]
+        left = np.cross(up, fwd)
+        old = float(m.vis.global_.fovy)
+        outs = []
+        try:
+            m.vis.global_.fovy = EYE_FOV
+            for side, sgn in (("l", 1.0), ("r", -1.0)):
+                pos = d.xpos[self.head_body] + fwd * 0.35 + left * (0.35 * sgn) + up * 0.1      # (the eye bodies sit at the mesh origin, so offset from the head)
+                ang = math.radians(EYE_YAW)
+                f = math.cos(ang) * fwd + math.sin(ang) * sgn * left
+                f = f / np.linalg.norm(f)
+                u = up - f * float(up @ f)
+                u = u / np.linalg.norm(u)
+                cam = mj.MjvCamera()
+                cam.type = mj.mjtCamera.mjCAMERA_FREE
+                cam.lookat[:] = pos + f * 0.5
+                cam.distance = 0.5
+                cam.azimuth = math.degrees(math.atan2(f[1], f[0]))
+                cam.elevation = math.degrees(math.asin(max(-1.0, min(1.0, f[2]))))
+                self.eye_renderer.update_scene(d, camera=cam)
+                for k in range(2):                           # roll the camera with the head (a free camera always keeps world-up)
+                    gc = self.eye_renderer.scene.camera[k]
+                    gc.pos[:] = pos + f * 0.12
+                    gc.forward[:] = f
+                    gc.up[:] = u
+                sc = self.eye_renderer.scene
+                for gi in range(sc.ngeom):                   # the eye looks out of the head: hide the head's own meshes
+                    g = sc.geoms[gi]
+                    if g.objtype == mj.mjtObj.mjOBJ_GEOM and 0 <= g.objid < m.ngeom and self._in_head[m.geom_bodyid[g.objid]]:
+                        g.rgba[3] = 0.0
+                self._draw_arena(self.eye_renderer, for_eye=True)
+                img = self.eye_renderer.render()
+                outs.append((255.0 * (img.mean(axis=2) / 255.0) ** 0.5).astype(np.uint8))      # lift the dark floor so its texture shows
+        except Exception:
+            return None
+        finally:
+            m.vis.global_.fovy = old
+        return outs[0], outs[1]
     def close(self):
+        if getattr(self, "eye_renderer", None) is not None:
+            try:
+                self.eye_renderer.close()
+            except Exception:
+                pass
+            self.eye_renderer = None
         if self.renderer is not None:
             try:
                 self.renderer.close()
@@ -1645,6 +1740,12 @@ class FlyControllerApp:
         self.nb.add(tab_motor, text="   Motor Properties   ")
         self.tab_motor = tab_motor
         self.build_motors(tab_motor)
+        tab_vis = ttk.Frame(self.nb)
+        self.nb.add(tab_vis, text="   Vision   ")
+        self.tab_vision = tab_vis
+        self.eye_hist = collections.deque(maxlen=120)
+        self._eye_prev = None
+        self.build_vision(tab_vis)
         tab_min = ttk.Frame(self.nb)
         self.nb.add(tab_min, text="   Minimize   ")
         self.build_minimized(tab_min)
@@ -1900,6 +2001,13 @@ class FlyControllerApp:
         self.make_slider(sliders, "Synapse gain", self.gain_var, 0.5, 8.0, "{:.2f}")
         self.make_slider(sliders, "Stim rate (Hz)", self.rate_var, 10, 300, "{:.0f}")
         self.make_slider(sliders, "Brush (px)", self.brush_var, 6, 70, "{:.0f}")
+        brow = ttk.Frame(sliders)
+        brow.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(brow, text="Fly body speed").pack(side=tk.LEFT)
+        self.body_speed_var = tk.StringVar(value="1x")
+        ttk.Combobox(brow, textvariable=self.body_speed_var, state="readonly", width=7,
+                     values=("0.1x", "0.25x", "0.5x", "1x")).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(brow, text="(slow motion for the body / legs)", foreground="#666666").pack(side=tk.LEFT, padx=(8, 0))
         self.status = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.status, font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
         ttk.Label(parent, textvariable=self.net_note, foreground="#666666").pack(anchor=tk.W)
@@ -2337,7 +2445,11 @@ class FlyControllerApp:
             else:
                 ft = 1.0 if feeding else 0.0               # (old brain file without MN9: extend while eating)
             self.body.feed += (ft - self.body.feed) * min(1.0, dt * 5.0)
-            self.body.step(fwd, back, left, right, dt)
+            try:
+                bs = float(self.body_speed_var.get().rstrip("x"))
+            except Exception:
+                bs = 1.0
+            self.body.step(fwd, back, left, right, dt * bs)
         eaten = self.arena.eaten
         if eaten > self.food_seen and self.food_key and self.cfg["walk"]:
             threading.Thread(target=self.tap, args=(self.food_key,), daemon=True).start()   # one tap per pellet eaten
@@ -2359,6 +2471,12 @@ class FlyControllerApp:
                           self.last_motion[0], self.last_motion[1]))
         if self.graph_win is not None and self.frame_i % 2 == 0:
             self.draw_graphs()
+        if self.frame_i % 3 == 2:
+            try:
+                if self.nb.select() == str(self.tab_vision):
+                    self.draw_vision()
+            except Exception as err:
+                print("[!] Vision page:", err)
         if self.frame_i % 4 == 0:
             try:
                 if self.nb.select() == str(self.tab_motor):         # only draw it while the page is open
@@ -2802,6 +2920,126 @@ class FlyControllerApp:
             self.motor_canvas.configure(scrollregion=(0, 0, img.shape[1], img.shape[0]))
         except tk.TclError:
             pass
+    # ------------------------------------------------------------------
+    # VISION TAB: what each compound eye sees + the neck's gaze-stabilising actuation (optimal vs. actual)
+    # ------------------------------------------------------------------
+    def build_vision(self, parent):
+        self.vision_canvas = tk.Canvas(parent, width=900, height=520, highlightthickness=0, bd=0, bg="#f0f0f0")
+        self.vision_canvas.pack(fill=tk.BOTH, expand=True)
+        self.vision_label = tk.Label(self.vision_canvas, bd=0, bg="#f0f0f0")
+        self.vision_canvas.create_window(0, 0, window=self.vision_label, anchor="nw")
+    @staticmethod
+    def _eye_mosaic(gray, size):
+        """Draw a greyscale camera image the way a compound eye samples it: one grey dot per ommatidium on a hex grid."""
+        bgc = 240
+        out = np.full((size, size, 3), bgc, np.uint8)
+        if gray is None:
+            return out
+        g = gray.astype(np.float32)
+        lo, hi = float(g.min()), float(g.max())
+        n = 30
+        step = size / n
+        gh, gw = g.shape
+        rad = max(1, int(step * 0.56))
+        for r in range(int(n / 0.866) + 1):
+            cy = r * step * 0.866 + step * 0.5
+            if cy > size:
+                break
+            for c in range(n + 1):
+                cx = (c + 0.5 * (r % 2)) * step
+                if cx > size:
+                    continue
+                if ((cx - size / 2) / (size * 0.5)) ** 2 + ((cy - size / 2) / (size * 0.47)) ** 2 > 1.0:
+                    continue                                       # eye-shaped patch
+                v = int(g[min(gh - 1, int(cy / size * gh)), min(gw - 1, int(cx / size * gw))])
+                cv2.circle(out, (int(cx), int(cy)), rad, (v, v, v), -1, cv2.LINE_AA)
+        return out
+    def _eye_motion(self, eyes):
+        """Image motion (optic flow) of each eye in deg/s since the last sample: phase correlation of two greyscale frames."""
+        now = time.perf_counter()
+        prev = self._eye_prev
+        self._eye_prev = (now, [e.astype(np.float32) for e in eyes])
+        if prev is None or now - prev[0] > 1.0 or now - prev[0] < 1e-3:
+            return
+        dt = now - prev[0]
+        win = cv2.createHanningWindow((eyes[0].shape[1], eyes[0].shape[0]), cv2.CV_32F)
+        deg_px = EYE_FOV / float(eyes[0].shape[1])
+        vals = []
+        for k in range(2):
+            try:
+                (dx, dy), resp = cv2.phaseCorrelate(prev[1][k], self._eye_prev[1][k], win)
+            except Exception:
+                dx = dy = resp = 0.0
+            if resp < 0.05:                                   # nothing to track (flat image)
+                dx = dy = 0.0
+            vals += [dx * deg_px / dt, -dy * deg_px / dt]       # + = image moves right / up
+        self.eye_hist.append((now, vals[0], vals[1], vals[2], vals[3]))
+    def render_vision(self, W, H, eyes=None):
+        bg, ink, dim, grid = (240, 240, 240), (20, 20, 20), (95, 95, 95), (215, 215, 215)
+        blue, orange = (200, 110, 30), (30, 140, 230)
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        img = np.full((H, W, 3), bg, np.uint8)
+        cv2.putText(img, "Vision", (14, 26), F, 0.7, ink, 1, cv2.LINE_AA)
+        cv2.putText(img, "what each eye sees, and how fast that picture moves across it (optic flow)", (110, 26), F, 0.45, dim, 1, cv2.LINE_AA)
+        top, pad = 44, 12
+        rh = (H - top - pad * 2) // 2
+        side = int(min(rh - 36, W * 0.38))
+        hist = list(self.eye_hist)
+        now = hist[-1][0] if hist else 0.0
+        WIN = 6.0
+        for row, (name, key) in enumerate((("Left eye raw vision", 0), ("Right eye raw vision", 1))):
+            y0 = top + row * (rh + pad)
+            cv2.putText(img, name, (14, y0 + 18), F, 0.55, ink, 1, cv2.LINE_AA)
+            tile = self._eye_mosaic(eyes[key] if eyes else None, side)
+            img[y0 + 28:y0 + 28 + side, 14:14 + side] = tile
+            cv2.rectangle(img, (14, y0 + 28), (14 + side, y0 + 28 + side), (205, 205, 205), 1)
+            # ---- image-motion plot of this eye (horizontal + vertical optic flow)
+            hi, vi = (1, 2) if row == 0 else (3, 4)
+            px0, px1 = 14 + side + 70, W - 24
+            py0, py1 = y0 + 34, y0 + rh - 34
+            if px1 - px0 < 120 or py1 - py0 < 60:
+                continue
+            title = "Image motion (optic flow)"
+            (tw, _), _ = cv2.getTextSize(title, F, 0.55, 1)
+            cv2.putText(img, title, ((px0 + px1 - tw) // 2, y0 + 18), F, 0.55, ink, 1, cv2.LINE_AA)
+            cv2.rectangle(img, (px0, py0), (px1, py1), (255, 255, 255), -1)
+            peak = max([abs(h[hi]) for h in hist] + [abs(h[vi]) for h in hist] + [10.0])
+            YR = float(np.ceil(peak * 1.15 / 10.0) * 10.0)
+            ymap = lambda v: int(py1 - (max(-YR, min(YR, v)) + YR) / (2 * YR) * (py1 - py0))
+            for gv in (-YR, -YR / 2, 0, YR / 2, YR):
+                cv2.line(img, (px0, ymap(gv)), (px1, ymap(gv)), grid if gv else (170, 170, 170), 1)
+                cv2.putText(img, f"{gv:.0f}", (px0 - 38, ymap(gv) + 4), F, 0.38, dim, 1, cv2.LINE_AA)
+            for k in range(0, 7):
+                gx = int(px0 + (px1 - px0) * k / 6.0)
+                cv2.line(img, (gx, py0), (gx, py1), grid, 1)
+                cv2.putText(img, f"{-(6 - k):d}", (gx - 8, py1 + 16), F, 0.38, dim, 1, cv2.LINE_AA)
+            cv2.putText(img, "Time [s]", ((px0 + px1) // 2 - 28, py1 + 30), F, 0.42, dim, 1, cv2.LINE_AA)
+            cv2.putText(img, "deg/s", (px0 - 38, py0 - 14), F, 0.38, dim, 1, cv2.LINE_AA)
+            cv2.rectangle(img, (px0, py0), (px1, py1), (170, 170, 170), 1)
+            pts_h, pts_v = [], []
+            for h in hist:
+                t = h[0] - now + WIN
+                if t < 0:
+                    continue
+                x = int(px0 + (px1 - px0) * t / WIN)
+                pts_h.append((x, ymap(h[hi])))
+                pts_v.append((x, ymap(h[vi])))
+            if len(pts_h) > 1:
+                cv2.polylines(img, [np.array(pts_h, np.int32)], False, blue, 2, cv2.LINE_AA)
+                cv2.polylines(img, [np.array(pts_v, np.int32)], False, orange, 2, cv2.LINE_AA)
+            lx = px1 - 230
+            cv2.line(img, (lx, py0 + 14), (lx + 22, py0 + 14), blue, 2, cv2.LINE_AA)
+            cv2.putText(img, "Horizontal (+ = to the right)", (lx + 28, py0 + 18), F, 0.4, ink, 1, cv2.LINE_AA)
+            cv2.line(img, (lx, py0 + 32), (lx + 22, py0 + 32), orange, 2, cv2.LINE_AA)
+            cv2.putText(img, "Vertical (+ = up)", (lx + 28, py0 + 36), F, 0.4, ink, 1, cv2.LINE_AA)
+        return img
+    def draw_vision(self):
+        W = max(700, self.vision_canvas.winfo_width() - 2)
+        H = max(420, self.vision_canvas.winfo_height() - 2)
+        eyes = self.body.render_eyes() if getattr(self.body, "renderer", None) is not None else None
+        if eyes:
+            self._eye_motion(eyes)
+        self.set_image(self.vision_label, self.render_vision(W, H, eyes))
     def build_minimized(self, parent):
         """4th page: a tiny 'parked' state. Selecting it shrinks the whole window; any other tab restores it."""
         try:
