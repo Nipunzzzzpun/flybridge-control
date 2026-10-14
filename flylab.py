@@ -1172,6 +1172,12 @@ DOWNLOAD_CMD = ("gsutil cp gs://flyem-male-cns/v1.0/connectome-data/flat-connect
                 "connectome-weights-male-cns-v1.0-minconf-0.5.feather C:/FlyBrain/")
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_settings.json")
 LAYOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_layout.json")
+SUGGEST_EMAIL = ""      # put your e-mail address here: the "Email it" button in Settings > Suggestions opens a message to it
+SUGGEST_STATUS = "Available"    # shown under Suggestions: "Available" (green), "Busy" (amber) or "Away" (red)
+DISCORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_discord.json")   # {"token": "<bot token>", "user_id": 123456789012345678}
+CONFETTI_SOUND = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "yipeeeeeeeee.mp3"),
+                  r"C:\Users\Nipun's Lovely PC\Downloads\Download\yipeeeeeeeee.mp3"]      # first one that exists is played with the confetti
+SUGGEST_REPO = "https://github.com/Nipunzzzzpun/flybridge-control"
 SETTING_DEFAULTS = {
     # performance
     "fps": "30", "body_hz": "30", "only_open": True, "show_fps": False,
@@ -1189,6 +1195,11 @@ SETTING_DEFAULTS = {
     "print_timings": False,
     "shadows": False,
     "profile": "Balanced",
+    # theme
+    "theme": "Light", "theme_mode": "Default",
+    # mapping
+    "kw_f": "w", "kw_b": "s", "kw_l": "a", "kw_r": "d", "ka_f": "up", "ka_b": "down", "ka_l": "left", "ka_r": "right", "kb_jump": "space",
+    "win_use": False, "win_follow": False, "win_pos": "",
 }
 GAITS = {
     "Tripod": {"lf": 0.0, "rm": 0.0, "lh": 0.0, "rf": 0.5, "lm": 0.5, "rh": 0.5},
@@ -2119,6 +2130,7 @@ class FlyControllerApp:
         self.vision_thread.start()
         self.update_preview()
         self.lab_t = time.perf_counter()
+        self._place_window()
         self.apply_settings()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
@@ -3036,9 +3048,6 @@ class FlyControllerApp:
         except Exception:
             pass
     def wsim_clear(self):
-        if abs(getattr(self, "_wp_ys", ys) - ys) > 0.5 and getattr(self, "_wp", None) is not None:
-            self._wp.clear()                                    # window was resized: the source moved, restart the emission
-        self._wp_ys = ys
         wp = getattr(self, "_wp", None)
         if wp is not None:
             wp.clear()
@@ -3067,6 +3076,9 @@ class FlyControllerApp:
         self._wsim_force = False
         self._wsim_drawn = True
         ys = YH - 6.0                                          # the source sits near the top; the wind blows downwards
+        if abs(getattr(self, "_wp_ys", ys) - ys) > 0.5 and getattr(self, "_wp", None) is not None:
+            self._wp.clear()                                    # window was resized: the source moved, restart the emission
+        self._wp_ys = ys
         wp = getattr(self, "_wp", None)
         if wp is None or abs(wp.half - 80.0) > 1e-6:
             wp = self._wp = Plume(80.0)
@@ -3795,6 +3807,16 @@ class FlyControllerApp:
                 b.apply_physics(b.KP, b.ADHESION, b.FRICTION, GRAVITY.get(self.S("grav"), 1.0))
             except Exception as err:
                 print("[!] physics settings:", err)
+        kb = {"wasd": tuple(self.S(k) or d for k, d in (("kw_f", "w"), ("kw_b", "s"), ("kw_l", "a"), ("kw_r", "d"))),
+              "arrows": tuple(self.S(k) or d for k, d in (("ka_f", "up"), ("ka_b", "down"), ("ka_l", "left"), ("ka_r", "right"))),
+              "jump": self.S("kb_jump") or "space"}
+        old_kb = self.cfg.get("kb")
+        self.cfg["kb"] = kb                                  # plain Python copy: the vision thread reads this, never the Tk variables
+        if old_kb is not None and old_kb != kb:
+            try:
+                self.clear_keys()                            # let go of keys held under the old mapping
+            except Exception:
+                pass
         OdorTracker.THR = float(self.S("thr"))
         Plume.DIFF, Plume.RATE, Plume.MAXN = float(self.S("diff")), float(self.S("rate")), int(float(self.S("maxn")))
         try:
@@ -3806,7 +3828,323 @@ class FlyControllerApp:
             self._grid_state = grid
             if hasattr(self, "arena"):
                 self.arena.version += 1                           # redraw the map's static layer
+        try:
+            self.apply_theme()
+        except Exception as err:
+            print("[!] theme:", err)
         self.save_settings()
+    # ---- status light (linked to a Discord bot)
+    def _start_discord(self):
+        try:
+            with open(DISCORD_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            token, uid = str(cfg["token"]).strip(), int(cfg["user_id"])
+        except Exception:
+            self._dc_state["note"] = "Discord not linked (create %s)" % DISCORD_FILE
+            return
+        try:
+            import discord, asyncio
+        except Exception:
+            self._dc_state["note"] = "Discord not linked (pip install discord.py)"
+            return
+        st = self._dc_state
+        def run():
+            intents = discord.Intents.default()
+            intents.presences = True
+            intents.members = True
+            client = discord.Client(intents=intents)
+            def look():
+                for g in client.guilds:
+                    m = g.get_member(uid)
+                    if m is not None:
+                        st["status"] = str(m.status)
+                        st["note"] = ""
+                        return
+                st["note"] = "Discord: you are not in a server with the bot"
+            @client.event
+            async def on_ready():
+                look()
+            @client.event
+            async def on_presence_update(before, after):
+                if after.id == uid:
+                    st["status"] = str(after.status)
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(client.start(token))
+            except Exception as err:
+                st["note"] = "Discord error: %s" % err
+        threading.Thread(target=run, daemon=True).start()
+    def _poll_status(self):
+        if self._dc_state.get("sent"):
+            m = self._dc_state.pop("sent")
+            if m == "OK":
+                self.sg_msg.set("Thank you for your suggestion! Your suggestion has been sent.")
+                self._play_yipee()
+                self._confetti()
+            else:
+                self.sg_msg.set(m)
+        st = self._dc_state.get("status")
+        if st is None:
+            col, txt = "#8a8a8a", self._dc_state.get("note") or SUGGEST_STATUS
+            if not self._dc_state.get("note"):
+                col = {"available": "#2ea043", "busy": "#e3a008", "away": "#d13438"}.get(SUGGEST_STATUS.lower(), "#8a8a8a")
+        else:
+            col, txt = {"online": ("#2ea043", "Available"), "idle": ("#e3a008", "Away"), "dnd": ("#d13438", "Busy")}.get(st, ("#8a8a8a", "Offline"))
+        try:
+            self._led.itemconfigure(self._led_dot, fill=col)
+            self._led_txt.set(txt)
+            self.root.after(1500, self._poll_status)
+        except Exception:
+            pass
+    # ---- suggestions
+    def _sg(self):
+        return self.sg_text.get("1.0", "end").strip()
+    def sg_email(self):
+        import webbrowser, urllib.parse
+        t = self._sg()
+        if not t:
+            self.sg_msg.set("Write something first.")
+        elif not SUGGEST_EMAIL:
+            self.root.clipboard_clear(); self.root.clipboard_append(t)
+            self.sg_msg.set("No e-mail address set yet (SUGGEST_EMAIL at the top of the file), so it was copied to the clipboard instead.")
+        else:
+            webbrowser.open("mailto:%s?subject=%s&body=%s" % (SUGGEST_EMAIL, urllib.parse.quote("FlyLab suggestion"), urllib.parse.quote(t)))
+            self.sg_msg.set("Opened your mail program.")
+    def sg_discord(self):
+        t = self._sg()
+        if not t:
+            self.sg_msg.set("Write something first.")
+            return
+        try:
+            with open(DISCORD_FILE, "r", encoding="utf-8") as f:
+                url = str(json.load(f).get("webhook_url", "")).strip()
+        except Exception:
+            url = ""
+        if not url:
+            self.sg_msg.set('Add "webhook_url" to flylab_discord.json first (Discord: channel settings > Integrations > Webhooks).')
+            return
+        self.sg_msg.set("Sending...")
+        st = self._dc_state
+        def send():
+            import urllib.request
+            try:
+                body = json.dumps({"content": ("**FlyLab suggestion**\n" + t)[:1900]}).encode("utf-8")
+                req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "FlyLab/1.0"})
+                urllib.request.urlopen(req, timeout=10).read()
+                st["sent"] = "OK"
+            except Exception as err:
+                st["sent"] = "Discord send failed: %s" % err
+        threading.Thread(target=send, daemon=True).start()
+    def _place_window(self):
+        """Open the window at the saved position (Settings > Mapping), kept on screen."""
+        try:
+            if not self.S("win_use"):
+                return
+            x, y = [int(float(v)) for v in str(self.S("win_pos")).split(",")]
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            self.root.geometry("+%d+%d" % (max(-20, min(x, sw - 120)), max(0, min(y, sh - 80))))
+        except Exception:
+            pass
+    def _play_yipee(self):
+        try:
+            path = next((p for p in CONFETTI_SOUND if os.path.isfile(p)), None)
+            if not path:
+                return
+            mci = ctypes.windll.winmm.mciSendStringW
+            mci("close yipee", None, 0, None)
+            if mci('open "%s" type mpegvideo alias yipee' % path, None, 0, None) == 0:
+                mci("play yipee", None, 0, None)           # returns at once, plays in the background
+        except Exception as err:
+            print("[!] sound:", err)
+    def _confetti(self):
+        """Confetti shoots from the bottom-left and bottom-right corners of the window, arcs up and falls. Drawn on a click-through transparent overlay."""
+        root = self.root
+        try:
+            root.update_idletasks()
+            x0, y0, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+            top = tk.Toplevel(root)
+            top.overrideredirect(True)
+            top.attributes("-topmost", True)
+            top.attributes("-transparentcolor", "#010101")
+            top.geometry("%dx%d+%d+%d" % (w, h, x0, y0))
+            cv = tk.Canvas(top, width=w, height=h, bg="#010101", highlightthickness=0, bd=0)
+            cv.pack()
+        except Exception:
+            return
+        try:
+            self.sg_text.delete("1.0", "end")
+        except Exception:
+            pass
+        cols = ["#f94144", "#f3722c", "#f9c74f", "#90be6d", "#43aa8b", "#4cc9f0", "#b5179e", "#ffffff"]
+        parts = []
+        for side in (0, 1):
+            for _ in range(45):
+                sz = random.randint(5, 10)
+                px, py = (6 if side == 0 else w - 6), h - 6
+                ang = math.radians(random.uniform(52, 82))
+                sp = random.uniform(0.9, 1.5) * h * 1.25              # px/s, scaled to the window height
+                vx = math.cos(ang) * sp * (1 if side == 0 else -1)
+                vy = -math.sin(ang) * sp
+                it = cv.create_rectangle(px, py, px + sz, py + sz * 0.6, fill=random.choice(cols), outline="")
+                parts.append([it, px, py, vx, vy, random.uniform(0, 0.25)])      # id, x, y, vx, vy, launch delay
+        t0 = time.perf_counter()
+        last = [t0]
+        def step():
+            now = time.perf_counter()
+            dt = min(0.05, now - last[0])
+            last[0] = now
+            alive = 0
+            for p in parts:
+                if now - t0 < p[5]:
+                    alive += 1
+                    continue
+                p[4] += 900 * dt                      # gravity
+                p[3] *= (1 - 0.8 * dt)                # air drag
+                p[4] *= (1 - 0.35 * dt)
+                dx, dy = p[3] * dt, p[4] * dt
+                p[1] += dx
+                p[2] += dy
+                if p[2] < h + 20:
+                    cv.move(p[0], dx, dy)
+                    alive += 1
+            if alive and now - t0 < 4.0:
+                root.after(24, step)
+            else:
+                try:
+                    top.destroy()
+                except Exception:
+                    pass
+        step()
+    def sg_github(self):
+        import webbrowser, urllib.parse
+        t = self._sg()
+        if not t:
+            self.sg_msg.set("Write something first.")
+            return
+        webbrowser.open("%s/issues/new?title=%s&body=%s" % (SUGGEST_REPO, urllib.parse.quote("FlyLab suggestion"), urllib.parse.quote(t[:1500])))
+        self.sg_msg.set("Opened a new GitHub issue in your browser.")
+    def sg_copy(self):
+        t = self._sg()
+        if t:
+            self.root.clipboard_clear(); self.root.clipboard_append(t)
+        self.sg_msg.set("Copied." if t else "Write something first.")
+    def sg_save(self):
+        t = self._sg()
+        if not t:
+            self.sg_msg.set("Write something first.")
+            return
+        p = os.path.join(os.path.dirname(os.path.abspath(SETTINGS_FILE)), "flylab_suggestions.txt")
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M] ") + t + "\n\n")
+            self.sg_msg.set("Saved to " + p)
+        except Exception as err:
+            self.sg_msg.set("Could not save: %s" % err)
+    # ---- themes
+    def _theme_now(self):
+        mode, th = self.S("theme_mode"), self.S("theme")
+        if mode == "Randomize":
+            if not hasattr(self, "_theme_rand"):
+                self._theme_rand = random.choice(["Light", "Dark"])
+            if getattr(self, "_theme_user_set", False):
+                return th if th in ("Light", "Dark") else self._sys_theme()
+            return self._theme_rand
+        return self._sys_theme() if th == "System" else ("Dark" if th == "Dark" else "Light")
+    def _sys_theme(self):
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            return "Light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "Dark"
+        except Exception:
+            return "Light"
+    def apply_theme(self):
+        want = self._theme_now()
+        sel = (self.S("theme"), self.S("theme_mode"))
+        if getattr(self, "_theme_sel", None) is not None and sel != self._theme_sel:
+            self._theme_user_set = True               # the user touched the controls: stop using the random pick
+            want = self._theme_now()
+        self._theme_sel = sel
+        if want == getattr(self, "_theme_on", None):
+            return
+        self._theme_on = want
+        dark = want == "Dark"
+        st = ttk.Style()
+        if not hasattr(self, "_theme_orig"):
+            self._theme_orig = st.theme_use()
+            self._lite_bg = self.root.winfo_rgb(st.lookup("TFrame", "background") or "#f0f0f0")
+            self._lite_fg = self.root.winfo_rgb("#555555")
+        bg, fg, fld, sel_bg = ("#202020", "#e6e6e6", "#2d2d2d", "#0067c0") if dark else (None, None, None, None)
+        if dark:
+            st.theme_use("clam")
+            st.configure(".", background=bg, foreground=fg, fieldbackground=fld, bordercolor="#555555", lightcolor=bg, darkcolor=bg,
+                         troughcolor="#2d2d2d", selectbackground=sel_bg, selectforeground="white", insertcolor=fg)
+            st.configure("TButton", background="#3a3a3a", foreground=fg, bordercolor="#555555", padding=3)
+            st.map("TButton", background=[("active", "#4a4a4a"), ("pressed", "#2a2a2a")])
+            st.configure("TNotebook", background=bg, bordercolor="#555555")
+            st.configure("TNotebook.Tab", background="#2d2d2d", foreground=fg, padding=(8, 3))
+            st.map("TNotebook.Tab", background=[("selected", "#3c3c3c")], foreground=[("selected", "white")])
+            st.configure("TCombobox", fieldbackground=fld, background="#3a3a3a", foreground=fg, arrowcolor=fg)
+            st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", fg)])
+            st.configure("TLabelframe", background=bg, bordercolor="#555555")
+            st.configure("TLabelframe.Label", background=bg, foreground=fg)
+            st.map("TCheckbutton", background=[("active", bg)], indicatorcolor=[("selected", sel_bg), ("!selected", fld)])
+            st.map("TRadiobutton", background=[("active", bg)], indicatorcolor=[("selected", sel_bg), ("!selected", fld)])
+            st.configure("TScrollbar", background="#3a3a3a", troughcolor="#2d2d2d", arrowcolor=fg, bordercolor=bg)
+            st.configure("Horizontal.TScale", background=bg, troughcolor="#3a3a3a")
+            self.root.option_add("*TCombobox*Listbox.background", fld)
+            self.root.option_add("*TCombobox*Listbox.foreground", fg)
+        else:
+            try:
+                st.theme_use(self._theme_orig)
+            except Exception:
+                pass
+            self.root.option_add("*TCombobox*Listbox.background", "white")
+            self.root.option_add("*TCombobox*Listbox.foreground", "black")
+        new_bg = self.root.winfo_rgb(bg) if dark else self._lite_bg
+        new_fg = self.root.winfo_rgb("#aaaaaa") if dark else self._lite_fg
+        cur_bg = self.root.winfo_rgb("#202020") if not dark else self._lite_bg
+        cur_fg = self.root.winfo_rgb("#aaaaaa") if not dark else self._lite_fg
+        hex_bg = "#202020" if dark else "#%02x%02x%02x" % tuple(c // 257 for c in self._lite_bg)
+        hex_fg = "#aaaaaa" if dark else "#555555"
+        mapping = {"#ffffff": "#000000", "#7a7a7a": "#9a9a9a"} if dark else {"#000000": "#ffffff", "#9a9a9a": "#7a7a7a"}
+        def walk(w):
+            cls = w.winfo_class()
+            if cls in ("Frame", "Label", "Canvas", "Text", "Listbox", "Toplevel", "Tk", "Labelframe", "Checkbutton", "Radiobutton", "Scale"):
+                for opt in ("background", "foreground"):
+                    try:
+                        val = w.cget(opt)
+                    except Exception:
+                        continue
+                    try:
+                        rgb = self.root.winfo_rgb(val)
+                    except Exception:
+                        continue
+                    if opt == "background" and rgb == cur_bg:
+                        w.configure(background=hex_bg)
+                    elif opt == "foreground" and rgb == cur_fg:
+                        w.configure(foreground=hex_fg)
+                if cls == "Text":
+                    w.configure(background="#2d2d2d" if dark else "white", foreground="#e6e6e6" if dark else "black", insertbackground="#e6e6e6" if dark else "black")
+                if cls == "Listbox":
+                    w.configure(background="#2d2d2d" if dark else "white", foreground="#e6e6e6" if dark else "black",
+                                highlightbackground="#555555" if dark else "#bbbbbb")
+                if cls == "Canvas":
+                    try:
+                        if int(float(w.cget("height"))) == 22:                 # the inset notes
+                            for it in w.find_all():
+                                if w.type(it) == "text":
+                                    c = w.itemcget(it, "fill").lower()
+                                    if c in mapping:
+                                        w.itemconfigure(it, fill=mapping[c])
+                    except Exception:
+                        pass
+            for ch in w.winfo_children():
+                walk(ch)
+        self.root.configure(background=hex_bg)
+        walk(self.root)
+        if hasattr(self, "arena"):
+            self.arena.version += 1
     def reset_settings(self, keys=None):
         for k, d in SETTING_DEFAULTS.items():
             if keys is None or k in keys:
@@ -3855,7 +4193,7 @@ class FlyControllerApp:
         cv.create_text(1, 11, text=note, anchor="w", font=(pix, 9), fill="#7a7a7a")
         body = ttk.Frame(parent)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(38, 12))
-        names = ["Performance", "Body & physics", "Smell & wind", "Build tab", "Display", "Recording", "Profiles", "Advanced"]
+        names = ["Performance", "Body & physics", "Smell & wind", "Build tab", "Display", "Recording", "Mapping", "Profiles", "Theme", "Advanced", "Suggestions"]
         left = ttk.Frame(body)
         left.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 14))
         lb = tk.Listbox(left, exportselection=False, activestyle="none", width=18, height=len(names), font=("Segoe UI", 10),
@@ -3965,6 +4303,107 @@ class FlyControllerApp:
         ttk.Button(row, text="Export graph data (CSV)", command=self.export_history).pack(side=tk.LEFT)
         self.rec_msg = tk.StringVar(value="Files go next to flylab.py")
         ttk.Label(b, textvariable=self.rec_msg, foreground="#555555", wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+        # --- Mapping
+        f = page("Mapping")
+        b = box(f, "Where the window opens")
+        check(b, "Open the window at the saved position", "win_use")
+        check(b, "Update the saved position when I close the program", "win_follow")
+        pos_msg = tk.StringVar(value="")
+        def pos_text():
+            p = str(self.S("win_pos"))
+            pos_msg.set("Saved position: " + (p.replace(",", ", ") if p else "none (Windows decides)"))
+        def save_pos():
+            self.sv["win_pos"].set("%d,%d" % (self.root.winfo_x(), self.root.winfo_y()))
+            pos_text()
+        def forget_pos():
+            self.sv["win_pos"].set("")
+            pos_text()
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(row, text="Save current position", command=save_pos).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Forget position", command=forget_pos).pack(side=tk.LEFT)
+        ttk.Label(b, textvariable=pos_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        pos_text()
+        def keyrow(fr, text, key):
+            r = ttk.Frame(fr)
+            r.pack(fill=tk.X, pady=2)
+            ttk.Label(r, text=text, width=26).pack(side=tk.LEFT)
+            var = self.sv[key]
+            btn = ttk.Button(r, width=14, text=(var.get() or "-").upper())
+            btn.pack(side=tk.LEFT)
+            def refresh(*_a):
+                btn.configure(text=(var.get() or "-").upper())
+            var.trace_add("write", refresh)
+            def start():
+                btn.configure(text="Press a key...")
+                btn.focus_set()
+                def on_key(e):
+                    btn.unbind("<KeyPress>")
+                    if e.keysym != "Escape":
+                        k = keysym_to_key(e.keysym)
+                        if k:
+                            var.set(k)
+                    refresh()
+                    return "break"
+                btn.bind("<KeyPress>", on_key)
+            btn.configure(command=start)
+        b = box(f, "Keybinds - click a key, then press the new one (Esc cancels)")
+        ttk.Label(b, text="WASD layout", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        for t, k in (("Forward", "kw_f"), ("Back", "kw_b"), ("Left", "kw_l"), ("Right", "kw_r")):
+            keyrow(b, t, k)
+        ttk.Label(b, text="Arrows layout", font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(8, 0))
+        for t, k in (("Forward", "ka_f"), ("Back", "ka_b"), ("Left", "ka_l"), ("Right", "ka_r")):
+            keyrow(b, t, k)
+        ttk.Label(b, text="Other", font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(8, 0))
+        keyrow(b, "Jump", "kb_jump")
+        r = ttk.Frame(b)
+        r.pack(fill=tk.X, pady=2)
+        ttk.Label(r, text="Food key (tapped per pellet)", width=26).pack(side=tk.LEFT)
+        fbtn = ttk.Button(r, width=14, text=(self.food_key or "-").upper())
+        fbtn.pack(side=tk.LEFT)
+        def food_start():
+            fbtn.configure(text="Press a key...")
+            fbtn.focus_set()
+            def on_key(e):
+                fbtn.unbind("<KeyPress>")
+                if e.keysym != "Escape":
+                    k = keysym_to_key(e.keysym)
+                    if k:
+                        self.set_food_key(k)
+                fbtn.configure(text=(self.food_key or "-").upper())
+                return "break"
+            fbtn.bind("<KeyPress>", on_key)
+        fbtn.configure(command=food_start)
+        def food_clear():
+            self.set_food_key("")
+            fbtn.configure(text="-")
+        ttk.Button(r, text="Clear", width=7, command=food_clear).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(b, text="Reset keybinds", command=lambda: self.reset_settings(["kw_f", "kw_b", "kw_l", "kw_r", "ka_f", "ka_b", "ka_l", "ka_r", "kb_jump"])).pack(anchor=tk.W, pady=(8, 0))
+        b = box(f, "Screen select")
+        reg_msg = tk.StringVar(value="")
+        def reg_text():
+            r_ = self.capture_region
+            reg_msg.set("Capture region: x %d, y %d, %d x %d px" % (r_["left"], r_["top"], r_["width"], r_["height"]))
+            try:
+                self.root.after(1000, reg_text)
+            except Exception:
+                pass
+        def reset_region():
+            self.capture_region = dict(DEFAULT_CAPTURE_REGION)
+            try:
+                with open(REGION_FILE, "w") as fh:
+                    json.dump(self.capture_region, fh)
+            except Exception:
+                pass
+        ttk.Label(b, textvariable=reg_msg, foreground="#555555").pack(anchor=tk.W)
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W, pady=(6, 0))
+        ttk.Button(row, text="Select capture region", command=lambda: self.select_region(force=True)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Reset region", command=reset_region).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Map Blooket buttons", command=self.map_blooket_buttons).pack(side=tk.LEFT)
+        ttk.Label(b, text="Select: drag a box around the fly. Blooket buttons are mapped for the game mode chosen on the Control Panel.", foreground="#555555",
+                  wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        reg_text()
         # --- Profiles
         f = page("Profiles")
         b = box(f, "Presets")
@@ -3975,6 +4414,19 @@ class FlyControllerApp:
         self.red_button(row, "Reset ALL settings", lambda: self.reset_settings()).pack(side=tk.LEFT)
         ttk.Label(b, text="Settings are saved automatically to flylab_settings.json and loaded next time.", foreground="#555555",
                   wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        # --- Theme
+        f = page("Theme")
+        b = box(f, "Appearance")
+        combo(b, "Theme", "theme", ("Light", "Dark", "System"))
+        ncv = tk.Canvas(b, width=260, height=22, bg=bg, highlightthickness=0, bd=0)       # inset note, same style as the top-left one
+        ncv.pack(anchor=tk.W, pady=(4, 2))
+        ncv.create_text(2, 12, text="More themes coming...", anchor="w", font=(pix, 9), fill="#ffffff")
+        ncv.create_text(1, 11, text="More themes coming...", anchor="w", font=(pix, 9), fill="#7a7a7a")
+        b = box(f, "When the program opens")
+        ttk.Radiobutton(b, text="Randomize Themes everytime when opening", variable=self.sv["theme_mode"], value="Randomize").pack(anchor=tk.W, pady=1)
+        ttk.Radiobutton(b, text="Default", variable=self.sv["theme_mode"], value="Default").pack(anchor=tk.W, pady=1)
+        ttk.Label(b, text="Default = the theme chosen above. Randomize = Light or Dark at random each start.", foreground="#555555",
+                  wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         # --- Advanced
         f = page("Advanced")
         b = box(f, "Debug")
@@ -3982,6 +4434,29 @@ class FlyControllerApp:
         ttk.Button(b, text="Copy diagnostic report", command=self.copy_report).pack(anchor=tk.W, pady=(4, 0))
         self.adv_msg = tk.StringVar(value="")
         ttk.Label(b, textvariable=self.adv_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        # --- Suggestions
+        f = page("Suggestions")
+        b = box(f, "Tell me what to add or fix")
+        ttk.Label(b, text="Send suggestions or bug reports", foreground="#555555").pack(anchor=tk.W)
+        self.sg_text = tk.Text(b, width=62, height=6, wrap="word", font=("Segoe UI", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbbbbb")
+        self.sg_text.pack(anchor=tk.W, pady=(4, 6))
+        self.sg_msg = tk.StringVar(value="")
+        row = ttk.Frame(b)
+        row.pack(anchor=tk.W)
+        for t, c in (("Send to Discord", self.sg_discord),):
+            ttk.Button(row, text=t, command=c).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(b, textvariable=self.sg_msg, foreground="#555555", wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        srow = ttk.Frame(b)
+        srow.pack(anchor=tk.W, pady=(10, 0))
+        self._led = tk.Canvas(srow, width=16, height=16, bg=bg, highlightthickness=0, bd=0)
+        self._led.pack(side=tk.LEFT, padx=(0, 6))
+        self._led_dot = self._led.create_oval(2, 2, 14, 14, fill="#8a8a8a", outline="")
+        self._led.create_oval(4, 3, 8, 7, fill="#ffffff", outline="", stipple="gray50")       # little highlight
+        self._led_txt = tk.StringVar(value=SUGGEST_STATUS)
+        ttk.Label(srow, textvariable=self._led_txt).pack(side=tk.LEFT)
+        self._dc_state = {"status": None, "note": ""}              # written by the Discord thread, read here (plain strings only)
+        self._start_discord()
+        self._poll_status()
         filler.pack(fill=tk.X)
         def relayout(_e=None):
             sc_cv.itemconfigure(win, width=max(50, sc_cv.winfo_width()))
@@ -4284,9 +4759,9 @@ class FlyControllerApp:
         ov.bind("<Escape>", lambda e: finish(False))
         say()
         ov.focus_force()
-    def select_region(self):
+    def select_region(self, force=False):
         """Dim the screen and let the user drag a box around the fly. Esc cancels."""
-        if self.selecting or self.terminating or self.source.get() != "screen":
+        if self.selecting or self.terminating or (self.source.get() != "screen" and not force):
             return
         self.selecting = True
         self.clear_keys()
@@ -4444,6 +4919,12 @@ class FlyControllerApp:
         if self.terminating:
             return
         self.terminating = True
+        try:
+            if self.S("win_follow"):
+                self.sv["win_pos"].set("%d,%d" % (self.root.winfo_x(), self.root.winfo_y()))
+                self.save_settings()
+        except Exception:
+            pass
         self.stop_event.set()
         self.sim.stop()
         try:
@@ -4457,8 +4938,17 @@ class FlyControllerApp:
         if self.vision_thread.is_alive() and waited_ms < 2000:
             self.root.after(30, self.finish_terminate, waited_ms + 30)
             return
-        for k in ALL_KEYS:
-            pydirectinput.keyUp(k)
+        extra = []
+        try:
+            kb = self.cfg.get("kb") or {}
+            extra = list(kb.get("wasd", ())) + list(kb.get("arrows", ())) + [kb.get("jump", "space")]
+        except Exception:
+            pass
+        for k in list(ALL_KEYS) + [e for e in extra if e not in ALL_KEYS]:
+            try:
+                pydirectinput.keyUp(k)
+            except Exception:
+                pass
         self.root.destroy()
     # ------------------------------------------------------------------
     # VISION LOOP (runs in its own thread; never touches Tk objects)
@@ -4512,7 +5002,7 @@ class FlyControllerApp:
                                 threading.Thread(target=self.execute_auto_replay, daemon=True).start()
                         if self.cfg["jump"] and not busy:
                             if dy > 1.2 and jump_cooldown == 0:
-                                self.tap('space')
+                                self.tap((self.cfg.get("kb") or {}).get("jump", 'space'))
                                 jump_cooldown = 15
                         if jump_cooldown > 0:
                             jump_cooldown -= 1
@@ -4540,10 +5030,11 @@ class FlyControllerApp:
                                         self.fire_blooket(key)
                                         bk_armed, bk_last, bk_fired = False, now_t, key
                             else:
+                                kbm = self.cfg.get("kb") or {}
                                 if mode == "wasd":
-                                    uk, dk, lk, rk = 'w', 's', 'a', 'd'
+                                    uk, dk, lk, rk = kbm.get("wasd", ('w', 's', 'a', 'd'))
                                 else:
-                                    uk, dk, lk, rk = 'up', 'down', 'left', 'right'
+                                    uk, dk, lk, rk = kbm.get("arrows", ('up', 'down', 'left', 'right'))
                                 if sdy > 0:
                                     self.hold(uk, True); self.hold(dk, False); current_action = "W"
                                 elif sdy < 0:
