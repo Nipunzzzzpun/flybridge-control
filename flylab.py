@@ -3605,8 +3605,9 @@ class FlyControllerApp:
             cv2.putText(img, vt, (x0 + 150 - tw, yy), F, 0.45, col, 1, cv2.LINE_AA)      # values right-aligned in one column
         for i in range(70):                                       # colour bar: no odour -> strong
             t = i / 69.0
-            c = tuple(int(u + (v - u) * t) for u, v in zip((225, 225, 225), (20, 120, 245)))
+            c = tuple(int(u + (v - u) * t) for u, v in zip((255, 255, 255), (0, 0, 0)))
             cv2.line(img, (x0 + w - 100 + i, y0 + h - 18), (x0 + w - 100 + i, y0 + h - 10), c, 1)
+        cv2.rectangle(img, (x0 + w - 101, y0 + h - 19), (x0 + w - 30, y0 + h - 9), (170, 170, 170), 1)       # outline so the white end is visible
         cv2.putText(img, "odour", (x0 + w - 100, y0 + h - 24), F, 0.36, dim, 1, cv2.LINE_AA)
         if head is None:
             cv2.putText(img, "(no 3-D head available)", (x0 + 20, y0 + h // 2), F, 0.45, dim, 1, cv2.LINE_AA)
@@ -3631,8 +3632,8 @@ class FlyControllerApp:
         tile[:] = (base * (0.55 + 0.6 * lum[..., None])).clip(0, 255)
         tile[body < 0] = 255
         def lerp(v):
-            a = np.array([225, 225, 225], np.float32)
-            bb = np.array([20, 120, 245], np.float32)
+            a = np.array([255, 255, 255], np.float32)                 # odour scale: white (none) -> black (strong)
+            bb = np.array([0, 0, 0], np.float32)
             return a + (bb - a) * max(0.0, min(1.0, v))
         marks = []
         for key, v, col, name in (("lant", vl, (200, 110, 30), "L"), ("rant", vr, (30, 140, 230), "R"), ("palp", vp, (60, 150, 60), "palps")):
