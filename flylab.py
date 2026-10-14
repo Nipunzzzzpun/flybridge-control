@@ -1141,6 +1141,33 @@ def keysym_to_key(sym):
     if sym[:1] == "F" and sym[1:].isdigit() and 1 <= int(sym[1:]) <= 12:
         return sym.lower()
     return ""
+_PULSE_CACHE = {}
+_PULSE_ERR = [False]
+def play_pulse(hz, ms=110):
+    """A short sine pulse (soft edges) played in the background. Safe to call from any thread; does nothing off Windows.
+    (winsound can't play from memory asynchronously, so each pitch is written once to a small .wav in the temp folder.)"""
+    try:
+        import winsound, wave, tempfile
+        hz = int(max(20, min(8000, round(float(hz)))))
+        path = _PULSE_CACHE.get(hz)
+        if path is None or not os.path.isfile(path):
+            sr = 44100
+            n = int(sr * ms / 1000)
+            t = np.arange(n) / sr
+            env = np.minimum(1.0, np.minimum(t, t[-1] - t) / 0.008)           # 8 ms fade in / out, no clicks
+            pcm = (np.sin(2 * np.pi * hz * t) * env * 0.35 * 32767).astype("<i2")
+            d = os.path.join(tempfile.gettempdir(), "flylab_pulses")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "pulse_%d.wav" % hz)
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+                w.writeframes(pcm.tobytes())
+            _PULSE_CACHE[hz] = path
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception as err:
+        if not _PULSE_ERR[0]:
+            _PULSE_ERR[0] = True
+            print("[!] pulse sound:", err)
 def load_blooket_map():
     """-> (list of game modes, {mode: {'1': [x, y], ..., 'continue': [x, y]}})"""
     modes, maps = list(GAME_MODES), {}
@@ -1201,6 +1228,9 @@ SETTING_DEFAULTS = {
     "kw_f": "w", "kw_b": "s", "kw_l": "a", "kw_r": "d", "ka_f": "up", "ka_b": "down", "ka_l": "left", "ka_r": "right", "kb_jump": "space",
     "win_use": False, "win_follow": False, "win_pos": "",
 }
+for _k, _hz in (("kw_f", 440), ("kw_b", 330), ("kw_l", 262), ("kw_r", 392), ("ka_f", 440), ("ka_b", 330), ("ka_l", 262), ("ka_r", 392), ("kb_jump", 523), ("food", 659)):
+    SETTING_DEFAULTS["hz_" + _k] = float(_hz)         # sine pulse pitch for that key
+    SETTING_DEFAULTS["pl_" + _k] = False              # play a pulse when that key is pressed
 GAITS = {
     "Tripod": {"lf": 0.0, "rm": 0.0, "lh": 0.0, "rf": 0.5, "lm": 0.5, "rh": 0.5},
     "Tetrapod (experimental)": {"lf": 0.0, "rm": 0.0, "lh": 1 / 3, "rf": 1 / 3, "lm": 2 / 3, "rh": 2 / 3},
@@ -2131,6 +2161,8 @@ class FlyControllerApp:
         self.update_preview()
         self.lab_t = time.perf_counter()
         self._place_window()
+        self.root.after(80, self._place_window)          # again once the start-up tab/size changes have settled
+        self.root.after(400, self._place_window)
         self.apply_settings()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
@@ -3810,6 +3842,19 @@ class FlyControllerApp:
         kb = {"wasd": tuple(self.S(k) or d for k, d in (("kw_f", "w"), ("kw_b", "s"), ("kw_l", "a"), ("kw_r", "d"))),
               "arrows": tuple(self.S(k) or d for k, d in (("ka_f", "up"), ("ka_b", "down"), ("ka_l", "left"), ("ka_r", "right"))),
               "jump": self.S("kb_jump") or "space"}
+        pm = {}
+        for k_, d_ in (("kw_f", "w"), ("kw_b", "s"), ("kw_l", "a"), ("kw_r", "d"), ("ka_f", "up"), ("ka_b", "down"), ("ka_l", "left"), ("ka_r", "right"), ("kb_jump", "space")):
+            try:
+                if self.S("pl_" + k_):
+                    pm[self.S(k_) or d_] = max(20.0, min(8000.0, float(self.S("hz_" + k_))))
+            except Exception:
+                pass
+        try:
+            if self.S("pl_food") and getattr(self, "food_key", ""):
+                pm[self.food_key] = max(20.0, min(8000.0, float(self.S("hz_food"))))
+        except Exception:
+            pass
+        self.cfg["pulse"] = pm
         old_kb = self.cfg.get("kb")
         self.cfg["kb"] = kb                                  # plain Python copy: the vision thread reads this, never the Tk variables
         if old_kb is not None and old_kb != kb:
@@ -3953,8 +3998,13 @@ class FlyControllerApp:
                 return
             mci = ctypes.windll.winmm.mciSendStringW
             mci("close yipee", None, 0, None)
-            if mci('open "%s" type mpegvideo alias yipee' % path, None, 0, None) == 0:
-                mci("play yipee", None, 0, None)           # returns at once, plays in the background
+            rc = mci('open "%s" type mpegvideo alias yipee' % path, None, 0, None)
+            if rc == 0:
+                rc = mci("play yipee", None, 0, None)      # returns at once, plays in the background
+            if rc != 0:
+                buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.winmm.mciGetErrorStringW(rc, buf, 255)
+                print("[!] yipee sound: MCI error %d: %s" % (rc, buf.value))
         except Exception as err:
             print("[!] sound:", err)
     def _confetti(self):
@@ -4213,6 +4263,19 @@ class FlyControllerApp:
         win = sc_cv.create_window(0, 0, window=holder, anchor="nw")
         filler = ttk.Frame(holder, height=1)
         pages = {}
+        def spin_wheel(w, var, lo, hi, step):
+            """The mouse wheel over a number box changes ONLY that value (the page stays put)."""
+            def on_wheel(e):
+                try:
+                    try:
+                        cur = float(var.get())
+                    except Exception:
+                        cur = lo
+                    var.set(max(lo, min(hi, cur + (step if e.delta > 0 else -step))))
+                except Exception:
+                    pass
+                return "break"
+            w.bind("<MouseWheel>", on_wheel)
         def page(name):
             f = ttk.Frame(holder)
             f.pack(fill=tk.X, expand=True, padx=(0, 10), pady=(0, 18))
@@ -4324,6 +4387,19 @@ class FlyControllerApp:
         ttk.Button(row, text="Forget position", command=forget_pos).pack(side=tk.LEFT)
         ttk.Label(b, textvariable=pos_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
         pos_text()
+        def pulse_ctl(r, hzk, plk):
+            sp = ttk.Spinbox(r, from_=20, to=8000, increment=10, width=6, textvariable=self.sv[hzk], format="%.0f")
+            sp.pack(side=tk.LEFT, padx=(10, 2))
+            spin_wheel(sp, self.sv[hzk], 20, 8000, 10)
+            ttk.Label(r, text="Hz").pack(side=tk.LEFT)
+            ttk.Checkbutton(r, text="pulse", variable=self.sv[plk]).pack(side=tk.LEFT, padx=(8, 0))
+            def preview(*_a):
+                try:
+                    if self.sv[plk].get():
+                        play_pulse(self.sv[hzk].get())
+                except Exception:
+                    pass
+            self.sv[plk].trace_add("write", preview)
         def keyrow(fr, text, key):
             r = ttk.Frame(fr)
             r.pack(fill=tk.X, pady=2)
@@ -4331,6 +4407,7 @@ class FlyControllerApp:
             var = self.sv[key]
             btn = ttk.Button(r, width=14, text=(var.get() or "-").upper())
             btn.pack(side=tk.LEFT)
+            pulse_ctl(r, "hz_" + key, "pl_" + key)
             def refresh(*_a):
                 btn.configure(text=(var.get() or "-").upper())
             var.trace_add("write", refresh)
@@ -4347,7 +4424,7 @@ class FlyControllerApp:
                     return "break"
                 btn.bind("<KeyPress>", on_key)
             btn.configure(command=start)
-        b = box(f, "Keybinds - click a key, then press the new one (Esc cancels)")
+        b = box(f, "Keybinds - click a key to change it (Esc cancels). Tick pulse to play a sine pulse at that Hz whenever the key is pressed")
         ttk.Label(b, text="WASD layout", font=("Arial", 9, "bold")).pack(anchor=tk.W)
         for t, k in (("Forward", "kw_f"), ("Back", "kw_b"), ("Left", "kw_l"), ("Right", "kw_r")):
             keyrow(b, t, k)
@@ -4361,6 +4438,7 @@ class FlyControllerApp:
         ttk.Label(r, text="Food key (tapped per pellet)", width=26).pack(side=tk.LEFT)
         fbtn = ttk.Button(r, width=14, text=(self.food_key or "-").upper())
         fbtn.pack(side=tk.LEFT)
+        self._food_btn = fbtn                        # kept in step with the Control Panel's "Map food to" box
         def food_start():
             fbtn.configure(text="Press a key...")
             fbtn.focus_set()
@@ -4378,6 +4456,7 @@ class FlyControllerApp:
             self.set_food_key("")
             fbtn.configure(text="-")
         ttk.Button(r, text="Clear", width=7, command=food_clear).pack(side=tk.LEFT, padx=(6, 0))
+        pulse_ctl(r, "hz_food", "pl_food")
         ttk.Button(b, text="Reset keybinds", command=lambda: self.reset_settings(["kw_f", "kw_b", "kw_l", "kw_r", "ka_f", "ka_b", "ka_l", "ka_r", "kb_jump"])).pack(anchor=tk.W, pady=(8, 0))
         b = box(f, "Screen select")
         reg_msg = tk.StringVar(value="")
@@ -4614,6 +4693,10 @@ class FlyControllerApp:
         except Exception:
             pass
     def refresh_food_box(self):
+        try:
+            self._food_btn.configure(text=(self.food_key or "-").upper())
+        except Exception:
+            pass
         if self.food_key:
             self.food_lbl.configure(text=self.food_key.upper(), fg="black")
         else:
@@ -4636,6 +4719,10 @@ class FlyControllerApp:
         self.food_key = key
         save_food_key(key)
         self.refresh_food_box()
+        try:
+            self._sched_apply()
+        except Exception:
+            pass
     def update_source_states(self):
         """Only allow selecting a capture area when Screen is the active fly source."""
         screen_selected = self.source.get() == "screen"
@@ -4836,19 +4923,19 @@ class FlyControllerApp:
         rect = canvas.create_rectangle(0, 0, 0, 0, outline=RED, width=1, state="hidden")
         hl2 = canvas.create_line(0, 0, sw, 0, fill=RED, width=1, state="hidden")       # guides through the dragged-to corner
         vl2 = canvas.create_line(0, 0, 0, sh, fill=RED, width=1, state="hidden")
-        st = {"x0": None, "y0": None}
+        st = {"x0": None, "y0": None, "xr": 0, "yr": 0, "open": True}
         def corner(x, y):
             pts = (x + ARM, y, x, y, x, y + ARM)
             canvas.coords(sh_b, *pts)
             canvas.coords(sh_w, *pts)
-        def move(e):
-            x, y = e.x, e.y
+        def show(xr, yr):
+            """Draw everything for pointer position (xr, yr) in screen pixels."""
+            x, y = xr - ov.winfo_rootx(), yr - ov.winfo_rooty()
             canvas.coords(hl, 0, y, sw, y)
             canvas.coords(vl, x, 0, x, sh)
             corner(x, y)
             if st["x0"] is None:
-                canvas.itemconfigure(lab, text="%d, %d" % (e.x_root, e.y_root))
-                canvas.coords(lab, x + 14, y + 14)
+                canvas.itemconfigure(lab, text="%d, %d" % (xr, yr))
             else:
                 x0, y0 = st["x0"], st["y0"]
                 canvas.itemconfigure(rect, state="normal")
@@ -4857,10 +4944,21 @@ class FlyControllerApp:
                 canvas.coords(vl2, x0, 0, x0, sh)
                 canvas.itemconfigure(hl2, state="normal")
                 canvas.itemconfigure(vl2, state="normal")
-                canvas.itemconfigure(lab, text="%d x %d" % (abs(e.x_root - st["xr"]), abs(e.y_root - st["yr"])))
-                canvas.coords(lab, x + 14, y + 14)
+                canvas.itemconfigure(lab, text="%d x %d" % (abs(xr - st["xr"]), abs(yr - st["yr"])))
+            canvas.coords(lab, x + 14, y + 14)
+        def tick():
+            # follow the pointer by polling, so the marker is there at once (before any mouse movement) and never stalls
+            if not st["open"]:
+                return
+            try:
+                px, py = ov.winfo_pointerxy()
+                show(px, py)
+                ov.after(15, tick)
+            except Exception:
+                pass
         def press(e):
-            st["x0"], st["y0"], st["xr"], st["yr"] = e.x, e.y, e.x_root, e.y_root
+            st["x0"], st["y0"] = e.x_root - ov.winfo_rootx(), e.y_root - ov.winfo_rooty()
+            st["xr"], st["yr"] = e.x_root, e.y_root
         def release(e):
             if st["x0"] is None:
                 return
@@ -4874,16 +4972,23 @@ class FlyControllerApp:
                 except Exception as err:
                     print(f"[!] Couldn't save region: {err}")
                 print(f"[✓] New capture region: {self.capture_region}")
+                self.root.after(1, lambda: None)
             finish()
-        def finish():
-            ov.destroy()
+        def finish(_e=None):
+            st["open"] = False
+            try:
+                ov.destroy()
+            except Exception:
+                pass
             self.selecting = False
-        canvas.bind("<Motion>", move)
-        canvas.bind("<B1-Motion>", move)
         canvas.bind("<ButtonPress-1>", press)
         canvas.bind("<ButtonRelease-1>", release)
-        ov.bind("<Escape>", lambda e: finish())
+        for w_ in (ov, canvas):
+            w_.bind("<Escape>", finish)
+        ov.lift()
         ov.focus_force()
+        canvas.focus_set()
+        tick()
     # ------------------------------------------------------------------
     # INPUT HELPERS
     # ------------------------------------------------------------------
@@ -4902,6 +5007,9 @@ class FlyControllerApp:
     def tap(self, key, hold_time=0.04):
         """A clean key tap that games register reliably."""
         self.klog(f"tap     {key}")
+        hz = (self.cfg.get("pulse") or {}).get(key)
+        if hz:
+            play_pulse(hz)
         pydirectinput.keyDown(key)
         time.sleep(hold_time)
         pydirectinput.keyUp(key)
@@ -4910,6 +5018,9 @@ class FlyControllerApp:
         with self.key_lock:
             if down and key not in self.held:
                 self.klog(f"down    {key}")
+                hz = (self.cfg.get("pulse") or {}).get(key)
+                if hz:
+                    play_pulse(hz)
                 pydirectinput.keyDown(key)
                 self.held.add(key)
             elif not down and key in self.held:
