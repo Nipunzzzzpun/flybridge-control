@@ -4399,9 +4399,10 @@ class FlyControllerApp:
         row = ttk.Frame(b)
         row.pack(anchor=tk.W, pady=(6, 0))
         ttk.Button(row, text="Select capture region", command=lambda: self.select_region(force=True)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Start mapping (aligned)", command=self.align_region).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(row, text="Reset region", command=reset_region).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(row, text="Map Blooket buttons", command=self.map_blooket_buttons).pack(side=tk.LEFT)
-        ttk.Label(b, text="Select: drag a box around the fly. Blooket buttons are mapped for the game mode chosen on the Control Panel.", foreground="#555555",
+        ttk.Label(b, text="Select: drag a box around the fly. Start mapping (aligned): a right-angle corner marker sits on the pointer with thin red guide lines across the screen, to line up a pop-up\'s corner exactly. Blooket buttons are mapped for the game mode chosen on the Control Panel.", foreground="#555555",
                   wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         reg_text()
         # --- Profiles
@@ -4801,6 +4802,86 @@ class FlyControllerApp:
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
+        ov.bind("<Escape>", lambda e: finish())
+        ov.focus_force()
+    def align_region(self):
+        """Aligned region select. A right-angle corner marker (arms pointing down and to the right) has its tip exactly on the mouse, and thin red lines
+        run across the whole screen through the tip, so a pop-up's top-left corner can be lined up exactly. Press = set that corner, drag, release = bottom-right.
+        Esc cancels."""
+        if self.selecting or self.terminating:
+            return
+        self.selecting = True
+        self.clear_keys()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        ov = tk.Toplevel(self.root)
+        ov.overrideredirect(True)
+        ov.geometry(f"{sw}x{sh}+0+0")
+        ov.attributes("-topmost", True)
+        ov.attributes("-alpha", 0.35)
+        ov.configure(bg="black")
+        canvas = tk.Canvas(ov, bg="black", highlightthickness=0, cursor="crosshair")
+        try:
+            canvas.configure(cursor="none")                    # the marker's tip IS the pointer
+        except Exception:
+            pass
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_text(sw // 2, 50, fill="white", font=("Arial", 18, "bold"),
+                           text="Put the corner's tip on the top-left of the area, press, drag to the bottom-right, release.  Esc = cancel")
+        RED, ARM = "#ff3030", 70
+        hl = canvas.create_line(0, 0, sw, 0, fill=RED, width=1)             # thin red guides across the whole screen
+        vl = canvas.create_line(0, 0, 0, sh, fill=RED, width=1)
+        sh_b = canvas.create_line(0, 0, 0, 0, 0, 0, fill="black", width=7)  # corner marker: dark outline under a white right angle
+        sh_w = canvas.create_line(0, 0, 0, 0, 0, 0, fill="white", width=3)
+        lab = canvas.create_text(0, 0, text="", fill="white", font=("Consolas", 11, "bold"), anchor="nw")
+        rect = canvas.create_rectangle(0, 0, 0, 0, outline=RED, width=1, state="hidden")
+        hl2 = canvas.create_line(0, 0, sw, 0, fill=RED, width=1, state="hidden")       # guides through the dragged-to corner
+        vl2 = canvas.create_line(0, 0, 0, sh, fill=RED, width=1, state="hidden")
+        st = {"x0": None, "y0": None}
+        def corner(x, y):
+            pts = (x + ARM, y, x, y, x, y + ARM)
+            canvas.coords(sh_b, *pts)
+            canvas.coords(sh_w, *pts)
+        def move(e):
+            x, y = e.x, e.y
+            canvas.coords(hl, 0, y, sw, y)
+            canvas.coords(vl, x, 0, x, sh)
+            corner(x, y)
+            if st["x0"] is None:
+                canvas.itemconfigure(lab, text="%d, %d" % (e.x_root, e.y_root))
+                canvas.coords(lab, x + 14, y + 14)
+            else:
+                x0, y0 = st["x0"], st["y0"]
+                canvas.itemconfigure(rect, state="normal")
+                canvas.coords(rect, x0, y0, x, y)
+                canvas.coords(hl2, 0, y0, sw, y0)
+                canvas.coords(vl2, x0, 0, x0, sh)
+                canvas.itemconfigure(hl2, state="normal")
+                canvas.itemconfigure(vl2, state="normal")
+                canvas.itemconfigure(lab, text="%d x %d" % (abs(e.x_root - st["xr"]), abs(e.y_root - st["yr"])))
+                canvas.coords(lab, x + 14, y + 14)
+        def press(e):
+            st["x0"], st["y0"], st["xr"], st["yr"] = e.x, e.y, e.x_root, e.y_root
+        def release(e):
+            if st["x0"] is None:
+                return
+            left, top = min(st["xr"], e.x_root), min(st["yr"], e.y_root)
+            w, h = abs(e.x_root - st["xr"]), abs(e.y_root - st["yr"])
+            if w >= 20 and h >= 20:
+                self.capture_region = {"top": int(top), "left": int(left), "width": int(w), "height": int(h)}
+                try:
+                    with open(REGION_FILE, "w") as fh:
+                        json.dump(self.capture_region, fh)
+                except Exception as err:
+                    print(f"[!] Couldn't save region: {err}")
+                print(f"[✓] New capture region: {self.capture_region}")
+            finish()
+        def finish():
+            ov.destroy()
+            self.selecting = False
+        canvas.bind("<Motion>", move)
+        canvas.bind("<B1-Motion>", move)
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<ButtonRelease-1>", release)
         ov.bind("<Escape>", lambda e: finish())
         ov.focus_force()
     # ------------------------------------------------------------------
