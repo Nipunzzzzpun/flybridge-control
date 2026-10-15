@@ -4251,7 +4251,7 @@ class FlyControllerApp:
         return s_
     def _static_fx(self, img):
         """Uranium look on the Control Panel's body camera when that camera is close to a rod (stronger the closer it is):
-        grey snow (Settings > Display > TV static) plus glitching (slipping rows + flicker, scaled by Settings > Display > Glitch amount)."""
+        grey snow (Settings > Display > TV static) plus glitch displacement (rows that slip sideways, scaled by Settings > Display > Glitch amount)."""
         k = self._rod_smooth() ** 1.2
         snow = bool(self.S("ur_static"))
         try:
@@ -4271,12 +4271,6 @@ class FlyControllerApp:
             noise = rng.integers(0, 256, (h, w, 1)).astype(np.float32)      # grey snow
             a = 0.75 * k                                                    # no floor: the snow starts from nothing
             out = out * (1.0 - a) + noise * a
-        out += (rng.random() - 0.5) * 40.0 * k * gl                         # brightness flicker
-        if gl > 1.0:                                                        # above 100%: the colour channels drift apart too
-            sh = int((gl - 1.0) * k * 4.0 + rng.random())
-            if sh:
-                out[..., 0] = np.roll(out[..., 0], sh, axis=1)
-                out[..., 2] = np.roll(out[..., 2], -sh, axis=1)
         return np.clip(out, 0, 255).astype(np.uint8)
     def _tick_loop(self):
         """Far from a rod: single radiation ticks at random moments, more and more often (and louder) as the camera gets closer; near it the full loop takes over."""
@@ -4759,7 +4753,7 @@ class FlyControllerApp:
         b = box(f, "Uranium effects (on the Control Panel camera)")
         check(b, "TV static (grey snow)", "ur_static")
         slide(b, "Glitch amount (%)", "ur_glitch", 0, 500, "{:.0f}")
-        ttk.Label(b, text="Glitch = rows that slip sideways and the brightness flicker (above 100% the colours also split apart). 0 turns it off.", foreground="#555555",
+        ttk.Label(b, text="Glitch = rows that slip sideways (how many rows slip and how far). It is separate from the TV static. 0 turns it off.", foreground="#555555",
                   wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         reset_btn(f, "display", ["topmost", "start_min", "ur_static", "ur_glitch"])
         # --- Recording
