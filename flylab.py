@@ -336,6 +336,9 @@ class Arena:
         self.obstacles, self.foods, self.food_spawn = [], [], []
         self.eaten = 0
         self.smell_range = FOOD_RANGE                      # mm: how far the smell of food reaches (Build tab slider)
+        self.skin = "Normal food"                          # the skin NEW food gets (Build tab > Food skin); each food keeps the skin it had when placed
+        self.food_skins = {}                               # (x, y) -> skin of that food
+        self.rad = []                                      # radiation particles [x, y, vx, vy, age, life] flying out of uranium rods (visual only)
         self.version = 0                                   # bumped whenever the layout changes (UI redraw)
         self.plume = Plume(self.half)
     def antennae(self, x, y, h):
@@ -356,7 +359,39 @@ class Arena:
     def add_obstacle(self, x, y, r):
         self.obstacles.append([float(x), float(y), float(r)])
         self.version += 1
+    def skin_of(self, x, y):
+        """The skin of the food at (x, y). Food that was never given one (default layout, loaded file) takes the current skin the first time it is seen."""
+        return self.food_skins.setdefault((round(float(x), 2), round(float(y), 2)), self.skin)
+    def rad_update(self, dt):
+        """Sharp radiation particles: each uranium rod fires fast, straight streaks in all directions; they stop at walls and obstacles."""
+        rods = [f for f in self.foods if self.skin_of(f[0], f[1]) == "Uranium rods"]
+        if not rods:
+            self.rad = []
+            return
+        dt = min(float(dt), 0.1)
+        for fx, fy, amt in rods:
+            a = food_angle(fx, fy)
+            n = int(55.0 * dt * max(0.25, min(1.0, amt)) + random.random())
+            for _ in range(n):
+                if len(self.rad) >= 650:
+                    break
+                u = random.uniform(-1.0, 1.0) * 1.1                        # emitted from anywhere along the rod
+                th, sp = random.uniform(0.0, 2.0 * math.pi), random.uniform(16.0, 38.0)
+                self.rad.append([fx + math.cos(a) * u, fy + math.sin(a) * u, math.cos(th) * sp, math.sin(th) * sp, 0.0, random.uniform(0.9, 1.7)])
+        m = self.half - 0.5
+        keep = []
+        for p in self.rad:
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[4] += dt
+            if p[4] >= p[5] or abs(p[0]) > m or abs(p[1]) > m:
+                continue
+            if any((p[0] - ox) ** 2 + (p[1] - oy) ** 2 < r * r for ox, oy, r in self.obstacles):
+                continue
+            keep.append(p)
+        self.rad = keep
     def add_food(self, x, y):
+        self.food_skins[(round(float(x), 2), round(float(y), 2))] = self.skin          # this food keeps the skin picked now
         self.foods.append([float(x), float(y), 1.0])
         self.food_spawn.append([float(x), float(y)])
         self.version += 1
@@ -368,6 +403,8 @@ class Arena:
         self.version += 1
     def clear(self):
         self.obstacles, self.foods, self.food_spawn = [], [], []
+        self.food_skins = {}
+        self.rad = []
         self.plume.clear()
         self.version += 1
     def refill(self):
@@ -1143,26 +1180,34 @@ def keysym_to_key(sym):
     return ""
 _PULSE_CACHE = {}
 _PULSE_ERR = [False]
-def play_pulse(hz, ms=110):
+MASTER_VOL = [100.0]                       # 0..100, set from Settings > Mapping > Sound
+MISC_VOL = [100.0]                         # confetti sound and other effects
+MAP_VOL = [100.0]                          # key pulses
+def play_pulse(hz, ms=110, group="map"):
     """A short sine pulse (soft edges) played in the background. Safe to call from any thread; does nothing off Windows.
     (winsound can't play from memory asynchronously, so each pitch is written once to a small .wav in the temp folder.)"""
     try:
         import winsound, wave, tempfile
         hz = int(max(20, min(8000, round(float(hz)))))
-        path = _PULSE_CACHE.get(hz)
+        sub = {"map": MAP_VOL[0], "misc": MISC_VOL[0]}.get(group, 100.0)          # which sub-volume this sound belongs to
+        vol = max(0.0, min(100.0, float(MASTER_VOL[0]) * float(sub) / 100.0))
+        if vol < 1:
+            return
+        vs = int(round(vol / 5.0) * 5)
+        path = _PULSE_CACHE.get((hz, vs))
         if path is None or not os.path.isfile(path):
             sr = 44100
             n = int(sr * ms / 1000)
             t = np.arange(n) / sr
             env = np.minimum(1.0, np.minimum(t, t[-1] - t) / 0.008)           # 8 ms fade in / out, no clicks
-            pcm = (np.sin(2 * np.pi * hz * t) * env * 0.35 * 32767).astype("<i2")
+            pcm = (np.sin(2 * np.pi * hz * t) * env * 0.35 * (vs / 100.0) * 32767).astype("<i2")
             d = os.path.join(tempfile.gettempdir(), "flylab_pulses")
             os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, "pulse_%d.wav" % hz)
+            path = os.path.join(d, "pulse_%d_%d.wav" % (hz, vs))
             with wave.open(path, "wb") as w:
                 w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
                 w.writeframes(pcm.tobytes())
-            _PULSE_CACHE[hz] = path
+            _PULSE_CACHE[(hz, vs)] = path
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
     except Exception as err:
         if not _PULSE_ERR[0]:
@@ -1204,6 +1249,19 @@ SUGGEST_STATUS = "Available"    # shown under Suggestions: "Available" (green), 
 DISCORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_discord.json")   # {"token": "<bot token>", "user_id": 123456789012345678}
 CONFETTI_SOUND = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "yipeeeeeeeee.mp3"),
                   r"C:\Users\Nipun's Lovely PC\Downloads\Download\yipeeeeeeeee.mp3"]      # first one that exists is played with the confetti
+GEIGER_SOUND = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "geiger-counter-clicking.mp3"),
+                r"C:\Users\Nipun's Lovely PC\Downloads\Download\geiger-counter-clicking.mp3"]      # played by the Uranium Radiation Loudness slider
+FOOD_SKINS = ("Normal food", "Uranium rods", "Apple slices")
+def food_angle(x, y):
+    """A fixed pseudo-random direction (radians) for the food at (x, y): the same food always lies the same way."""
+    v = math.sin(x * 12.9898 + y * 78.233) * 43758.5453
+    return (v - math.floor(v)) * 2.0 * math.pi
+def _rotz(a):
+    c, s_ = math.cos(a), math.sin(a)
+    return np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1.0]])
+_ROTY90 = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])         # turns a cylinder's / capsule's long axis from z to x (lies down)
+RADIATION_SOUND = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "radiation.mp3"),
+                   r"C:\Users\Nipun's Lovely PC\Downloads\Download\radiation.mp3"]        # looped while the fly is near a uranium rod
 SUGGEST_REPO = "https://github.com/Nipunzzzzpun/flybridge-control"
 SETTING_DEFAULTS = {
     # performance
@@ -1215,7 +1273,7 @@ SETTING_DEFAULTS = {
     # smell and wind
     "thr": 0.04, "diff": 0.3, "rate": 90.0, "maxn": 9000.0, "turb": 0.8, "wind_mode": "Steady", "smoke_obst": True,
     # build tab
-    "show_grid": True, "show_trail": True, "snap": False,
+    "show_grid": True, "show_trail": True, "snap": False, "food_skin": "Normal food",
     # display
     "topmost": True, "start_min": True,
     # advanced
@@ -1226,7 +1284,7 @@ SETTING_DEFAULTS = {
     "theme": "Light", "theme_mode": "Default",
     # mapping
     "kw_f": "w", "kw_b": "s", "kw_l": "a", "kw_r": "d", "ka_f": "up", "ka_b": "down", "ka_l": "left", "ka_r": "right", "kb_jump": "space",
-    "win_use": False, "win_follow": False, "win_pos": "",
+    "win_use": False, "win_follow": False, "win_pos": "", "volume": 100.0, "vol_misc": 100.0, "vol_map": 100.0, "vol_uranium": 100.0,
 }
 for _k, _hz in (("kw_f", 440), ("kw_b", 330), ("kw_l", 262), ("kw_r", 392), ("ka_f", 440), ("ka_b", 330), ("ka_l", 262), ("ka_r", 392), ("kb_jump", 523), ("food", 659)):
     SETTING_DEFAULTS["hz_" + _k] = float(_hz)         # sine pulse pitch for that key
@@ -1481,10 +1539,10 @@ class NeuroMechFlyBody:
         """Add walls, obstacles and food to the rendered scene (visual only; collisions are handled in step)."""
         sc, mj = (rend or self.renderer).scene, self.mj
         eye = np.eye(3).ravel()
-        def add(kind, size, pos, rgba):
+        def add(kind, size, pos, rgba, mat=None):
             if sc.ngeom >= sc.maxgeom:
                 return
-            mj.mjv_initGeom(sc.geoms[sc.ngeom], kind, np.asarray(size, float), np.asarray(pos, float), eye,
+            mj.mjv_initGeom(sc.geoms[sc.ngeom], kind, np.asarray(size, float), np.asarray(pos, float), eye if mat is None else np.asarray(mat, float).ravel(),
                             np.asarray(rgba, np.float32))
             sc.ngeom += 1
         if self.arena is not None:
@@ -1500,6 +1558,30 @@ class NeuroMechFlyBody:
                 r = 0.25 + 0.45 * max(0.0, min(1.0, amt))
                 if for_eye:                                     # bigger + brighter in the eyes' greyscale view so food stands out
                     add(mj.mjtGeom.mjGEOM_SPHERE, [r * 1.8, 0, 0], [fx, fy, r * 1.8], (1.0, 0.9, 0.45, 1.0))
+                elif self.arena.skin_of(fx, fy) == "Uranium rods":
+                    a = food_angle(fx, fy)
+                    m = _rotz(a) @ _ROTY90                                           # rod lies flat, pointing along a (random per food)
+                    am = max(0.0, min(1.0, amt))
+                    rr, hl = 0.17 + 0.09 * am, 0.9 + 0.5 * am
+                    CAP, CYL = mj.mjtGeom.mjGEOM_CAPSULE, mj.mjtGeom.mjGEOM_CYLINDER
+                    for k, al in ((9.0, 0.025), (6.0, 0.04), (3.8, 0.07), (2.4, 0.11), (1.6, 0.17)):            # glow: nested translucent shells, brighter near the rod
+                        add(CAP, [rr * k, hl, 0], [fx, fy, rr], (0.30, 1.0, 0.10, al), m)
+                    add(mj.mjtGeom.mjGEOM_ELLIPSOID, [hl + rr * 9, rr * 8, 0.02], [fx, fy, 0.02], (0.30, 1.0, 0.10, 0.07), _rotz(a))     # light spilled on the floor
+                    add(mj.mjtGeom.mjGEOM_ELLIPSOID, [hl + rr * 4.5, rr * 4, 0.02], [fx, fy, 0.025], (0.35, 1.0, 0.12, 0.12), _rotz(a))
+                    add(CYL, [rr, hl, 0], [fx, fy, rr], (0.28, 0.95, 0.10, 1.0), m)                              # the rod
+                    add(CYL, [rr * 0.55, hl * 1.01, 0], [fx, fy, rr], (0.80, 1.0, 0.60, 1.0), m)                 # hot, pale core
+                elif self.arena.skin_of(fx, fy) == "Apple slices":
+                    # one halved apple lying cut-side up: red skin rim, pale flesh, a little star-shaped core with five seeds
+                    a0 = food_angle(fx, fy)
+                    R = r * 2.0
+                    CYL = mj.mjtGeom.mjGEOM_CYLINDER
+                    add(CYL, [R * 1.05, R * 0.10, 0], [fx, fy, R * 0.10], (0.78, 0.07, 0.10, 1.0))                  # red skin edge
+                    add(CYL, [R * 0.97, R * 0.12, 0], [fx, fy, R * 0.12], (0.98, 0.95, 0.76, 1.0))                  # flesh (top face)
+                    add(CYL, [R * 0.27, R * 0.125, 0], [fx, fy, R * 0.12], (0.93, 0.86, 0.55, 1.0))                 # core area
+                    for k_ in range(5):
+                        th = a0 + k_ * 2.0 * math.pi / 5.0
+                        add(mj.mjtGeom.mjGEOM_ELLIPSOID, [R * 0.11, R * 0.045, R * 0.03],
+                            [fx + math.cos(th) * R * 0.16, fy + math.sin(th) * R * 0.16, R * 0.25], (0.33, 0.14, 0.08, 1.0), _rotz(th))      # seeds
                 else:
                     add(mj.mjtGeom.mjGEOM_SPHERE, [r, 0, 0], [fx, fy, r], (0.95, 0.55, 0.12, 1.0))
         for p, f in (): # (contact arrows removed)                       # ground-contact force arrows (magenta), like neuromechfly.org
@@ -2163,6 +2245,7 @@ class FlyControllerApp:
         self._place_window()
         self.root.after(80, self._place_window)          # again once the start-up tab/size changes have settled
         self.root.after(400, self._place_window)
+        self.root.after(1000, self._geiger_tick)
         self.apply_settings()
         self.update_lab()
         self.root.protocol("WM_DELETE_WINDOW", self.terminate)
@@ -2775,6 +2858,7 @@ class FlyControllerApp:
                 wspd *= max(0.0, 1.0 + 0.6 * math.sin(now * 0.7) * math.sin(now * 0.23 + 1.0))
             self.arena.plume.update(dt, self.arena.foods, wspd, float(self.wind_dir_var.get()), turb=float(self.S("turb")),
                                     obstacles=self.arena.obstacles if self.S("smoke_obst") else ())
+        self.arena.rad_update(dt)
         if self.sim.running and dynamic:
             feeding = self.arena.feed(self.body.x, self.body.y, dt)
         cl = cr = 0.0                                      # odour at the two antennae (plume + any test pulse from the Miscellaneous page)
@@ -2854,7 +2938,7 @@ class FlyControllerApp:
         self._primed = True
         on_ctrl = sel == str(self.tab_ctrl) or not self.S("only_open")
         if prime or (on_ctrl and self.S("draw_body")):
-            self.set_image(self.body_label, self.body.render(VIEW_W, VIEW_H))
+            self.set_image(self.body_label, self._static_fx(self.body.render(VIEW_W, VIEW_H)))
         if prime or (on_ctrl and self.S("draw_cloud")):
             self.set_image(self.cloud_label, self.render_cloud())
         self.status.set(
@@ -2903,6 +2987,10 @@ class FlyControllerApp:
         self.build_tool = tk.StringVar(value="obstacle")
         for text, val in (("Place obstacle", "obstacle"), ("Place food", "food"), ("Erase", "erase"), ("Move fly here", "fly")):
             ttk.Radiobutton(side, text=text, variable=self.build_tool, value=val).pack(anchor=tk.W, pady=1)
+        frow = ttk.Frame(side)
+        frow.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(frow, text="Food skin", width=10).pack(side=tk.LEFT)
+        ttk.Combobox(frow, textvariable=self.sv["food_skin"], values=FOOD_SKINS, state="readonly", width=15).pack(side=tk.LEFT)
         self.obst_r_var = tk.DoubleVar(value=4.0)
         self.make_slider(side, "Obstacle size (mm)", self.obst_r_var, 1.5, 9.0, "{:.1f}", label_w=17)
         self.smell_model = tk.StringVar(value=SMELL_PLUME)
@@ -3211,7 +3299,31 @@ class FlyControllerApp:
             for fx, fy, amt in self.arena.foods:
                 cx, cy = self._w2c(fx, fy)
                 rr = 2.0 + 3.5 * max(0.0, min(1.0, amt))
-                cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill="#f08c1f", outline="#ffc27a", tags="static")
+                skin = self.arena.skin_of(fx, fy)
+                if skin == "Uranium rods":
+                    a = food_angle(fx, fy)
+                    dx, dy = math.cos(a), -math.sin(a)                         # world y is up, canvas y is down
+                    hl, wd = rr * 1.9, max(3.0, rr * 0.9)
+                    for k, col in ((5.2, "#0e2a14"), (3.8, "#14401c"), (2.7, "#1d6126"), (1.9, "#2f9a38"), (1.3, "#4fd04c")):   # glow, fading out
+                        cv.create_line(cx - dx * hl, cy - dy * hl, cx + dx * hl, cy + dy * hl, width=wd * k, capstyle="round", fill=col, tags="static")
+                    cv.create_line(cx - dx * hl, cy - dy * hl, cx + dx * hl, cy + dy * hl, width=wd, capstyle="round", fill="#7dff3c", tags="static")
+                    cv.create_line(cx - dx * hl, cy - dy * hl, cx + dx * hl, cy + dy * hl, width=max(1.0, wd * 0.4), capstyle="round", fill="#e6ffcf", tags="static")
+                elif skin == "Apple slices":
+                    ra = rr * 1.9
+                    a0 = food_angle(fx, fy)
+                    bb = (cx - ra, cy - ra, cx + ra, cy + ra)
+                    cv.create_oval(bb, fill="#f8f0cc", outline="#e6d9a2", tags="static")                                    # flesh
+                    cv.create_arc(bb, start=math.degrees(a0), extent=200, style="arc", outline="#c1272d", width=2, tags="static")     # red skin rim on one side
+                    cv.create_oval(cx - ra * 0.27, cy - ra * 0.27, cx + ra * 0.27, cy + ra * 0.27, fill="#ecdd9a", outline="", tags="static")   # core area
+                    for k_ in range(5):                                                                                        # five seeds in a star
+                        th = a0 + k_ * 2.0 * math.pi / 5.0
+                        ux, uy = math.cos(th), math.sin(th)
+                        mx, my = cx + ux * ra * 0.17, cy + uy * ra * 0.17
+                        L, Wd = ra * 0.13, ra * 0.05
+                        cv.create_polygon(mx - ux * L, my - uy * L, mx - uy * Wd, my + ux * Wd, mx + ux * L, my + uy * L, mx + uy * Wd, my - ux * Wd,
+                                          fill="#5a2a14", outline="", tags="static")
+                else:
+                    cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill="#f08c1f", outline="#ffc27a", tags="static")
             cv.tag_lower("static")
         b = self.body
         if not self.trail or math.hypot(b.x - self.trail[-1][0], b.y - self.trail[-1][1]) > 0.6:
@@ -3226,6 +3338,16 @@ class FlyControllerApp:
         self._arena_primed = True
         cv.delete("smell")
         cv.delete("plume")
+        cv.delete("rad")
+        if self.arena.rad:
+            A, B, C = (230, 255, 207), (57, 255, 20), (15, 74, 20)
+            for px_, py_, vx_, vy_, ag, lf in self.arena.rad:
+                fr = ag / lf
+                t0, c0, c1 = (fr * 2.0, A, B) if fr < 0.5 else ((fr - 0.5) * 2.0, B, C)
+                col = "#%02x%02x%02x" % tuple(int(c0[k] + (c1[k] - c0[k]) * t0) for k in range(3))
+                x0_, y0_ = self._w2c(px_, py_)
+                x1_, y1_ = self._w2c(px_ - vx_ * 0.07, py_ - vy_ * 0.07)                       # a short sharp streak along its direction
+                cv.create_line(x1_, y1_, x0_, y0_, fill=col, width=2 if fr < 0.4 else 1, tags="rad")
         if on_build and self.S("draw_smoke") and self.smell_model.get() == SMELL_PLUME and len(self.arena.plume.age):
             img = self.plume_overlay()
             if img is not None:
@@ -3442,7 +3564,8 @@ class FlyControllerApp:
         ROW = max(15.0, min(34.0, (H - TOP - PAD * (len(grid) + 1)) / units))
         sc = max(0.8, min(1.5, ROW / 22.0))
         BW = (W - PAD * (ncol + 1)) // ncol
-        need = int(TOP + sum((max(nrows_of(i) for i in r) + 2.0) * ROW + PAD for r in grid) + PAD)
+        OFF = max(0, int(1.6 * ROW - 34))                     # each box title sits this much lower, close above its first row (rows stay put)
+        need = int(TOP + sum((max(nrows_of(i) for i in r) + 2.0) * ROW + PAD - OFF for r in grid) + PAD)
         img = np.full((max(H, need), W, 3), bg, np.uint8)
         d = body.data
         cv2.putText(img, "Motor properties", (PAD, 24), F, 0.7, ink, 1, cv2.LINE_AA)
@@ -3461,12 +3584,17 @@ class FlyControllerApp:
         leg_col = {"lf": (200, 110, 150), "lm": (205, 130, 90), "lh": (110, 170, 215),
                    "rf": (80, 160, 235), "rm": (95, 200, 140), "rh": (205, 190, 80), "head": (150, 150, 150)}
         def group(x0, y0, h, title):
-            cv2.rectangle(img, (x0, y0 + 9), (x0 + BW, y0 + h), edge, 1)
+            y0 += OFF
+            cv2.rectangle(img, (x0, y0 + 9), (x0 + BW, y0 - OFF + h), edge, 1)
             (tw, _), _ = cv2.getTextSize(title, F, 0.5 * sc ** 0.5, 1)
             cv2.rectangle(img, (x0 + 8, y0), (x0 + 20 + tw, y0 + 18), bg, -1)
             cv2.putText(img, title, (x0 + 14, y0 + 14), F, 0.5 * sc ** 0.5, ink, 1, cv2.LINE_AA)
         fs = min(0.38 * sc, 0.29 * BW / 265.0)          # keep the longest label clear of the bars
         SPAN = math.radians(100.0)
+        lab_w = 0                                         # widest joint label, so the slider track starts after it
+        for _nm, _rows in byid.values():
+            for _r in _rows:
+                lab_w = max(lab_w, cv2.getTextSize(_r[0], F, fs, 1)[0][0])
         y = TOP
         for r in grid:
             nr = max(nrows_of(i) for i in r)
@@ -3492,11 +3620,22 @@ class FlyControllerApp:
                 group(x0, y, h, f"{name} ({len(rows)})")
                 if it in body.LEGS:
                     fz = float(body.leg_force[body.LEGS.index(it)])
-                    bx = x0 + BW - 120
-                    cv2.putText(img, f"foot {fz:4.1f} uN", (bx - 70, y + 15), F, 0.38, dim, 1, cv2.LINE_AA)
-                    cv2.rectangle(img, (bx + 20, y + 8), (bx + 108, y + 13), groove, -1)
-                    cv2.rectangle(img, (bx + 20, y + 8), (bx + 20 + int(88 * min(1.0, fz / FMAX)), y + 13), (200, 60, 220), -1)
-                tx0, tx1 = x0 + int(BW * 0.34), x0 + int(BW * 0.70)
+                    # foot-force readout, laid out from the right edge; it gives way before it can touch the title
+                    (ttw2, _), _ = cv2.getTextSize(f"{name} ({len(rows)})", F, 0.5 * sc ** 0.5, 1)
+                    title_end = x0 + 20 + ttw2
+                    bar_r = x0 + BW - 12
+                    for bar_w, word in ((88, "foot "), (60, "foot "), (44, "")):
+                        ftxt = f"{word}{fz:4.1f} uN"
+                        (fw, _), _ = cv2.getTextSize(ftxt, F, 0.38, 1)
+                        fx = bar_r - bar_w - 8 - fw
+                        if fx >= title_end + 24:
+                            break
+                    cv2.rectangle(img, (fx - 6, y + OFF), (bar_r + 6, y + OFF + 18), bg, -1)       # the box line stops behind the readout, like behind the title
+                    cv2.putText(img, ftxt, (fx, y + OFF + 15), F, 0.38, dim, 1, cv2.LINE_AA)
+                    cv2.rectangle(img, (bar_r - bar_w, y + OFF + 8), (bar_r, y + OFF + 13), groove, -1)
+                    cv2.rectangle(img, (bar_r - bar_w, y + OFF + 8), (bar_r - bar_w + int(bar_w * min(1.0, fz / FMAX)), y + OFF + 13), (200, 60, 220), -1)
+                tx1 = x0 + int(BW * 0.70)
+                tx0 = min(x0 + max(int(BW * 0.34), 10 + lab_w + 14), tx1 - 60)
                 for i, (label, tgt, act, tq, hz, neu) in enumerate(rows):
                     top = int(y + 1.6 * ROW + i * ROW)
                     cy = int(top + ROW / 2)
@@ -3514,7 +3653,7 @@ class FlyControllerApp:
                     self._deg_text(img, math.degrees(act), x0 + int(BW * 0.73), cy + 4, ink, fs)
                     hzt = f"{hz:4.1f} Hz" if hz > 0.05 else "- Hz"
                     cv2.putText(img, hzt, (x0 + int(BW * 0.88), cy + 4), F, fs, dim if hz < 0.05 else blue, 1, cv2.LINE_AA)
-            y += h + PAD
+            y += h + PAD - OFF
         return img
     def draw_motors(self):
         W = max(700, self.motor_canvas.winfo_width() - 2)
@@ -3710,7 +3849,8 @@ class FlyControllerApp:
         F = cv2.FONT_HERSHEY_SIMPLEX
         img = np.full((H, W, 3), bg, np.uint8)
         cv2.putText(img, "Miscellaneous", (14, 22), F, 0.65, ink, 1, cv2.LINE_AA)
-        cv2.putText(img, "vision and smell", (150, 22), F, 0.45, dim, 1, cv2.LINE_AA)
+        (ttw, _), _ = cv2.getTextSize("Miscellaneous", F, 0.65, 1)
+        cv2.putText(img, "vision and smell", (14 + ttw + 16, 22), F, 0.45, dim, 1, cv2.LINE_AA)
         top, pad = 52, 14
         half = (H - top - pad) // 2
         # ---------------- top half: eyes (right eye on the left of the left eye) + optic-flow graphs
@@ -3855,6 +3995,12 @@ class FlyControllerApp:
         except Exception:
             pass
         self.cfg["pulse"] = pm
+        try:
+            MASTER_VOL[0] = float(self.S("volume"))
+            MISC_VOL[0] = float(self.S("vol_misc"))
+            MAP_VOL[0] = float(self.S("vol_map"))
+        except Exception:
+            pass
         old_kb = self.cfg.get("kb")
         self.cfg["kb"] = kb                                  # plain Python copy: the vision thread reads this, never the Tk variables
         if old_kb is not None and old_kb != kb:
@@ -3866,6 +4012,14 @@ class FlyControllerApp:
         Plume.DIFF, Plume.RATE, Plume.MAXN = float(self.S("diff")), float(self.S("rate")), int(float(self.S("maxn")))
         try:
             self.root.attributes("-topmost", bool(self.S("topmost")))
+        except Exception:
+            pass
+        try:
+            if self.S("food_skin") == "Apples":
+                self.sv["food_skin"].set("Apple slices")          # old name
+            if hasattr(self, "arena") and self.S("food_skin") != getattr(self.arena, "skin", None):
+                self.arena.skin = self.S("food_skin") if self.S("food_skin") in FOOD_SKINS else "Normal food"
+                self.arena.version += 1
         except Exception:
             pass
         grid = (bool(self.S("show_grid")), bool(self.S("show_trail")))
@@ -3981,6 +4135,50 @@ class FlyControllerApp:
             except Exception as err:
                 st["sent"] = "Discord send failed: %s" % err
         threading.Thread(target=send, daemon=True).start()
+    def make_vol_slider(self, parent, var, lo=0, hi=100, step=5, preview=None):
+        """Flat, ribbed-thumb slider (the dark slider's design, in the light theme; it follows the theme). Wheel changes only the value."""
+        fr = ttk.Frame(parent)
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        cv = tk.Canvas(fr, width=200, height=18, highlightthickness=0, bd=0, bg=bg)
+        cv.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        lab = ttk.Label(fr, width=6, anchor="w")
+        lab.pack(side=tk.LEFT, padx=(4, 0))
+        TW = 30
+        def val():
+            try:
+                return max(lo, min(hi, float(var.get())))
+            except Exception:
+                return lo
+        def redraw(*_a):
+            try:
+                dark = getattr(self, "_theme_on", None) == "Dark"
+                p = (dict(trk="#2f2f2f", edge="#4d4d4d", thumb="#3b3b3b", tedge="#5c5c5c", grip="#8c8c8c") if dark
+                     else dict(trk="#dedede", edge="#bdbdbd", thumb="#f1f1f1", tedge="#a2a2a2", grip="#6c6c6c"))
+                w, h = max(60, cv.winfo_width()), 18
+                cv.delete("all")
+                cv.create_rectangle(0, 2, w - 1, h - 3, fill=p["trk"], outline=p["edge"])             # thin flat track
+                x = TW / 2 + 1 + (val() - lo) / float(hi - lo) * (w - TW - 3)
+                cv.create_rectangle(x - TW / 2, 1, x + TW / 2, h - 2, fill=p["thumb"], outline=p["tedge"])   # thumb a touch taller than the track
+                for dx in (-3, 0, 3):
+                    cv.create_line(x + dx, 5, x + dx, h - 6, fill=p["grip"])
+                lab.configure(text=str(int(round(val()))))
+            except Exception:
+                pass
+        def set_x(ex):
+            w = max(60, cv.winfo_width())
+            frac = (ex - TW / 2 - 1) / float(w - TW - 3)
+            var.set(float(round(lo + max(0.0, min(1.0, frac)) * (hi - lo))))
+        cv.bind("<Configure>", redraw)
+        cv.bind("<ButtonPress-1>", lambda e: set_x(e.x))
+        cv.bind("<B1-Motion>", lambda e: set_x(e.x))
+        cv.bind("<ButtonRelease-1>", lambda e: preview() if preview else None)      # hear the new level
+        def wheel(e):
+            var.set(max(lo, min(hi, val() + (step if e.delta > 0 else -step))))
+            return "break"
+        cv.bind("<MouseWheel>", wheel)
+        var.trace_add("write", redraw)
+        self.__dict__.setdefault("_vol_redraws", []).append(redraw)
+        return fr
     def _place_window(self):
         """Open the window at the saved position (Settings > Mapping), kept on screen."""
         try:
@@ -3991,6 +4189,145 @@ class FlyControllerApp:
             self.root.geometry("+%d+%d" % (max(-20, min(x, sw - 120)), max(0, min(y, sh - 80))))
         except Exception:
             pass
+    def _uranium_dist(self):
+        """Distance (mm) from the fly to the nearest uranium rod, or None if there is none."""
+        try:
+            rods = [f for f in self.arena.foods if self.arena.skin_of(f[0], f[1]) == "Uranium rods"]
+            if rods and getattr(self, "body", None) is not None:
+                return min(math.hypot(f[0] - self.body.x, f[1] - self.body.y) for f in rods)
+        except Exception:
+            pass
+        return None
+    def _rod_closeness(self):
+        """0..1: how close the body CAMERA is to the nearest uranium rod (1 = within 4 mm, 0 = 16 mm or more). Uses the camera's real position
+        (the thorax it follows, minus its zoom distance along the view direction), so moving or zooming the camera changes it."""
+        try:
+            rods = [f for f in self.arena.foods if self.arena.skin_of(f[0], f[1]) == "Uranium rods"]
+            if not rods or getattr(self, "body", None) is None:
+                return 0.0
+            c = self.body.cam
+            look = np.asarray(self.body.data.xpos[c.trackbodyid], float)
+            az, el = math.radians(float(c.azimuth)), math.radians(float(c.elevation))
+            fwd = np.array([math.cos(az) * math.cos(el), math.sin(az) * math.cos(el), math.sin(el)])
+            pos = look - float(c.distance) * fwd
+            dc = min(math.sqrt((pos[0] - f[0]) ** 2 + (pos[1] - f[1]) ** 2 + (pos[2] - 0.2) ** 2) for f in rods)
+            return max(0.0, min(1.0, (16.0 - dc) / 12.0))
+        except Exception:
+            return 0.0
+    def _rod_smooth(self):
+        """The closeness, eased over time (rises over ~0.6 s, falls over ~1 s) so the static and the sound fade in and out instead of switching."""
+        raw = self._rod_closeness()
+        raw = raw * raw * (3.0 - 2.0 * raw)                               # smoothstep: gentle at both ends
+        now = time.perf_counter()
+        s_ = getattr(self, "_rs", 0.0)
+        dt = min(0.5, max(0.0, now - getattr(self, "_rs_t", now)))
+        s_ += (raw - s_) * (1.0 - math.exp(-dt / (0.6 if raw > s_ else 1.0)))
+        self._rs, self._rs_t = s_, now
+        return s_
+    def _static_fx(self, img):
+        """TV-static on the Control Panel's body camera when that camera is close to a uranium rod (stronger the closer it is)."""
+        k = self._rod_smooth() ** 1.2
+        if k < 0.02:
+            return img
+        rng = self._rng_fx = getattr(self, "_rng_fx", np.random.default_rng())
+        h, w = img.shape[:2]
+        out = img.astype(np.float32)
+        for _ in range(int(2 + 10 * k)):                                   # horizontal tearing: a few rows slip sideways
+            y0 = int(rng.integers(0, h))
+            hh = int(rng.integers(1, 5))
+            out[y0:y0 + hh] = np.roll(out[y0:y0 + hh], int(rng.integers(-1, 2) * (4 + 28 * k)), axis=1)
+        noise = rng.integers(0, 256, (h, w, 1)).astype(np.float32)          # grey snow
+        a = 0.15 + 0.7 * k
+        out = out * (1.0 - a) + noise * a
+        out += (rng.random() - 0.5) * 40.0 * k                              # brightness flicker
+        return np.clip(out, 0, 255).astype(np.uint8)
+    def _gl_fast(self):
+        """Seamless loop: shortly before the playing copy of the clip ends, start the other copy, so the two overlap and there is no gap."""
+        if not getattr(self, "_gl_open", False) or self.terminating:
+            self._gl_fast_on = False
+            return
+        try:
+            mci = ctypes.windll.winmm.mciSendStringW
+            idx = self._gl_idx
+            v = max(0.0, min(100.0, float(MASTER_VOL[0]) * float(self.S("vol_uranium")) / 100.0)) * self._rod_smooth()
+            vi = int(v * 10)
+            if vi != getattr(self, "_gl_vi", -1):                       # fade the volume smoothly, 25 times a second
+                self._gl_vi = vi
+                for k_ in (0, 1):
+                    mci("setaudio geigerloop%d volume to %d" % (k_, vi), None, 0, None)
+            buf = ctypes.create_unicode_buffer(64)
+            mci("status geigerloop%d position" % idx, buf, 63, None)
+            pos = int(buf.value or 0)
+            mci("status geigerloop%d mode" % idx, buf, 63, None)
+            playing = buf.value == "playing"
+            if (not playing) or (self._gl_len > 0 and self._gl_len - pos <= 450):       # 0.45 s before the end (or it already stopped)
+                nxt = 1 - idx
+                mci("play geigerloop%d from 0" % nxt, None, 0, None)
+                self._gl_idx = nxt
+        except Exception:
+            pass
+        self.root.after(40, self._gl_fast)
+    def _geiger_tick(self):
+        """While the fly is near a uranium rod, loop the Geiger clip (louder the closer it gets) until the rod is eaten or the fly walks away."""
+        try:
+            mci = ctypes.windll.winmm.mciSendStringW
+            on = getattr(self, "_gl_on", False)
+            cl = self._rod_smooth()                                 # how close the camera is to a rod (0..1), eased
+            if cl < 0.01:
+                on = False                                          # start / stop levels differ, so it doesn't flutter on and off
+            elif cl >= 0.04:
+                on = True
+            if on:
+                if not getattr(self, "_gl_open", False):
+                    path = next((p for p in RADIATION_SOUND if os.path.isfile(p)), None)
+                    ok = bool(path)
+                    for k_ in (0, 1):                               # two copies of the clip, so one can start before the other ends
+                        ok = ok and mci('open "%s" type mpegvideo alias geigerloop%d' % (path, k_), None, 0, None) == 0
+                        mci("set geigerloop%d time format milliseconds" % k_, None, 0, None)
+                    if ok:
+                        buf = ctypes.create_unicode_buffer(64)
+                        mci("status geigerloop0 length", buf, 63, None)
+                        self._gl_len = int(buf.value or 0)
+                        self._gl_idx = 0
+                        self._gl_open = True
+                        self._gl_vi = -1
+                        for k_ in (0, 1):
+                            mci("setaudio geigerloop%d volume to 0" % k_, None, 0, None)               # start silent, then fade in (see _gl_fast)
+                        mci("play geigerloop0 from 0", None, 0, None)
+                        if not getattr(self, "_gl_fast_on", False):
+                            self._gl_fast_on = True
+                            self.root.after(30, self._gl_fast)
+                    else:
+                        mci("close geigerloop0", None, 0, None)
+                        mci("close geigerloop1", None, 0, None)
+                        on = False
+            elif getattr(self, "_gl_open", False):
+                for k_ in (0, 1):
+                    mci("stop geigerloop%d" % k_, None, 0, None)
+                    mci("close geigerloop%d" % k_, None, 0, None)
+                self._gl_open = False
+            self._gl_on = on
+        except Exception as err:
+            if not getattr(self, "_gl_err", False):
+                self._gl_err = True
+                print("[!] geiger loop:", err)
+        if not self.terminating:
+            self.root.after(250, self._geiger_tick)
+    def _play_geiger(self):
+        """Geiger-counter clicks at Master x Uranium loudness (the Uranium Radiation Loudness slider's preview)."""
+        try:
+            path = next((p for p in GEIGER_SOUND if os.path.isfile(p)), None)
+            if not path:
+                print("[!] geiger sound: put geiger-counter-clicking.mp3 next to the program")
+                return
+            mci = ctypes.windll.winmm.mciSendStringW
+            mci("close geiger", None, 0, None)
+            if mci('open "%s" type mpegvideo alias geiger' % path, None, 0, None) == 0:
+                v = max(0.0, min(100.0, float(MASTER_VOL[0]) * float(self.S("vol_uranium")) / 100.0))
+                mci("setaudio geiger volume to %d" % int(v * 10), None, 0, None)
+                mci("play geiger", None, 0, None)
+        except Exception as err:
+            print("[!] geiger sound:", err)
     def _play_yipee(self):
         try:
             path = next((p for p in CONFETTI_SOUND if os.path.isfile(p)), None)
@@ -4000,6 +4337,7 @@ class FlyControllerApp:
             mci("close yipee", None, 0, None)
             rc = mci('open "%s" type mpegvideo alias yipee' % path, None, 0, None)
             if rc == 0:
+                mci("setaudio yipee volume to %d" % int(max(0, min(100, float(MASTER_VOL[0]) * float(MISC_VOL[0]) / 100.0)) * 10), None, 0, None)
                 rc = mci("play yipee", None, 0, None)      # returns at once, plays in the background
             if rc != 0:
                 buf = ctypes.create_unicode_buffer(256)
@@ -4193,6 +4531,8 @@ class FlyControllerApp:
                 walk(ch)
         self.root.configure(background=hex_bg)
         walk(self.root)
+        for rd in getattr(self, "_vol_redraws", []):
+            rd()
         if hasattr(self, "arena"):
             self.arena.version += 1
     def reset_settings(self, keys=None):
@@ -4424,6 +4764,15 @@ class FlyControllerApp:
                     return "break"
                 btn.bind("<KeyPress>", on_key)
             btn.configure(command=start)
+        b = box(f, "Sound")
+        for text, key, prev in (("Master Volume", "volume", lambda: play_pulse(500, group="master")),
+                                ("Misc. Volume", "vol_misc", lambda: play_pulse(500, group="misc")),
+                                ("Mapping Volume", "vol_map", lambda: play_pulse(500, group="map")),
+                                ("Uranium Radiation Loudness", "vol_uranium", lambda: self._play_geiger())):
+            r = ttk.Frame(b)
+            r.pack(fill=tk.X, pady=2)
+            ttk.Label(r, text=text, width=26).pack(side=tk.LEFT)
+            self.make_vol_slider(r, self.sv[key], preview=prev).pack(side=tk.LEFT, fill=tk.X, expand=True)
         b = box(f, "Keybinds - click a key to change it (Esc cancels). Tick pulse to play a sine pulse at that Hz whenever the key is pressed")
         ttk.Label(b, text="WASD layout", font=("Arial", 9, "bold")).pack(anchor=tk.W)
         for t, k in (("Forward", "kw_f"), ("Back", "kw_b"), ("Left", "kw_l"), ("Right", "kw_r")):
@@ -4573,6 +4922,18 @@ class FlyControllerApp:
         sbar.bind("<B1-Motion>", lambda _e: sync())
         sbar.bind("<ButtonRelease-1>", lambda _e: sync())
         lb.selection_set(0)
+        # the mouse wheel never changes a dropdown's value; over a dropdown on this page it just scrolls the page
+        self.root.bind_class("TCombobox", "<MouseWheel>", lambda e: "break")
+        def page_wheel(e):
+            sc_cv.yview_scroll(int(-e.delta / 120) * 3, "units")
+            sync()
+            return "break"
+        def hook(w):
+            for ch in w.winfo_children():
+                if ch.winfo_class() == "TCombobox":
+                    ch.bind("<MouseWheel>", page_wheel)
+                hook(ch)
+        hook(holder)
     def red_button(self, parent, text, command):
         """A red, white-text button that has exactly the size, font and rounded corners of the neighbouring ttk buttons (native ttk buttons can't be recoloured)."""
         import tkinter.font as tkfont
@@ -5111,6 +5472,11 @@ class FlyControllerApp:
         if self.terminating:
             return
         self.terminating = True
+        try:
+            ctypes.windll.winmm.mciSendStringW("close geigerloop0", None, 0, None)
+            ctypes.windll.winmm.mciSendStringW("close geigerloop1", None, 0, None)
+        except Exception:
+            pass
         try:
             if self.S("win_follow"):
                 self.sv["win_pos"].set("%d,%d" % (self.root.winfo_x(), self.root.winfo_y()))
