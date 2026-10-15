@@ -4202,15 +4202,16 @@ class FlyControllerApp:
             except Exception as err:
                 st["sent"] = "Discord send failed: %s" % err
         threading.Thread(target=send, daemon=True).start()
-    def make_vol_slider(self, parent, var, lo=0, hi=100, step=5, preview=None):
+    def make_vol_slider(self, parent, var, lo=0, hi=100, step=5, preview=None, big=False):
         """Flat, ribbed-thumb slider (the dark slider's design, in the light theme; it follows the theme). Wheel changes only the value."""
         fr = ttk.Frame(parent)
         bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
-        cv = tk.Canvas(fr, width=200, height=18, highlightthickness=0, bd=0, bg=bg)
+        H = 30 if big else 18                                      # the Master Volume slider is taller and has a wider thumb
+        cv = tk.Canvas(fr, width=200, height=H, highlightthickness=0, bd=0, bg=bg)
         cv.pack(side=tk.LEFT, fill=tk.X, expand=True)
         lab = ttk.Label(fr, width=6, anchor="w")
         lab.pack(side=tk.LEFT, padx=(4, 0))
-        TW = 30
+        TW = 46 if big else 30
         def val():
             try:
                 return max(lo, min(hi, float(var.get())))
@@ -4221,13 +4222,13 @@ class FlyControllerApp:
                 dark = getattr(self, "_theme_on", None) == "Dark"
                 p = (dict(trk="#2f2f2f", edge="#4d4d4d", thumb="#3b3b3b", tedge="#5c5c5c", grip="#8c8c8c") if dark
                      else dict(trk="#dedede", edge="#bdbdbd", thumb="#f1f1f1", tedge="#a2a2a2", grip="#6c6c6c"))
-                w, h = max(60, cv.winfo_width()), 18
+                w, h = max(60, cv.winfo_width()), H
                 cv.delete("all")
-                cv.create_rectangle(0, 2, w - 1, h - 3, fill=p["trk"], outline=p["edge"])             # thin flat track
+                cv.create_rectangle(0, 2 + (3 if big else 0), w - 1, h - 3 - (3 if big else 0), fill=p["trk"], outline=p["edge"])             # thin flat track
                 x = TW / 2 + 1 + (val() - lo) / float(hi - lo) * (w - TW - 3)
                 cv.create_rectangle(x - TW / 2, 1, x + TW / 2, h - 2, fill=p["thumb"], outline=p["tedge"])   # thumb a touch taller than the track
                 for dx in (-3, 0, 3):
-                    cv.create_line(x + dx, 5, x + dx, h - 6, fill=p["grip"])
+                    cv.create_line(x + dx, 5 + (3 if big else 0), x + dx, h - 6 - (3 if big else 0), fill=p["grip"])    # same 3 px spacing between the lines on both sizes
                 lab.configure(text=str(int(round(val()))))
             except Exception:
                 pass
@@ -4873,7 +4874,7 @@ class FlyControllerApp:
             r = ttk.Frame(b)
             r.pack(fill=tk.X, pady=2)
             ttk.Label(r, text=text, width=26).pack(side=tk.LEFT)
-            self.make_vol_slider(r, self.sv[key], preview=prev).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.make_vol_slider(r, self.sv[key], preview=prev, big=(key == "volume")).pack(side=tk.LEFT, fill=tk.X, expand=True)
         b = box(f, "Keybinds - click a key to change it (Esc cancels). Tick pulse to play a sine pulse at that Hz whenever the key is pressed")
         ttk.Label(b, text="WASD layout", font=("Arial", 9, "bold")).pack(anchor=tk.W)
         for t, k in (("Forward", "kw_f"), ("Back", "kw_b"), ("Left", "kw_l"), ("Right", "kw_r")):
