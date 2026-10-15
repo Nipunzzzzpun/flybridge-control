@@ -4146,6 +4146,15 @@ class FlyControllerApp:
         except Exception:
             pass
     # ---- suggestions
+    def _sg_who(self):
+        """The name typed under the suggestion box ('' while it still shows the placeholder)."""
+        try:
+            n = self.sg_name.get().strip()
+            if n == self._sg_ph and str(self.sg_name.cget("foreground")) == "#8a8a8a":
+                return ""
+            return n[:60]
+        except Exception:
+            return ""
     def _sg(self):
         return self.sg_text.get("1.0", "end").strip()
     def sg_email(self):
@@ -4173,11 +4182,12 @@ class FlyControllerApp:
             self.sg_msg.set('Add "webhook_url" to flylab_discord.json first (Discord: channel settings > Integrations > Webhooks).')
             return
         self.sg_msg.set("Sending...")
+        who = self._sg_who()
         st = self._dc_state
         def send():
             import urllib.request
             try:
-                body = json.dumps({"content": ("**FlyLab suggestion**\n" + t)[:1900]}).encode("utf-8")
+                body = json.dumps({"content": ("**FlyLab suggestion" + (" from " + who if who else "") + "**\n" + t)[:1900]}).encode("utf-8")
                 req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "FlyLab/1.0"})
                 urllib.request.urlopen(req, timeout=10).read()
                 st["sent"] = "OK"
@@ -4964,7 +4974,24 @@ class FlyControllerApp:
         b = box(f, "Tell me what to add or fix")
         ttk.Label(b, text="Send suggestions or bug reports", foreground="#555555").pack(anchor=tk.W)
         self.sg_text = tk.Text(b, width=62, height=6, wrap="word", font=("Segoe UI", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbbbbb")
-        self.sg_text.pack(anchor=tk.W, pady=(4, 6))
+        self.sg_text.pack(anchor=tk.W, pady=(4, 4))
+        PH = "Enter your name here"
+        self._sg_ph = PH
+        self.sg_name = ttk.Entry(b, width=30)
+        self.sg_name.insert(0, PH)
+        self.sg_name.configure(foreground="#8a8a8a")
+        def name_in(_e=None):
+            if self.sg_name.get() == PH and str(self.sg_name.cget("foreground")) == "#8a8a8a":
+                self.sg_name.delete(0, tk.END)
+                self.sg_name.configure(foreground="")
+        def name_out(_e=None):
+            if not self.sg_name.get().strip():
+                self.sg_name.delete(0, tk.END)
+                self.sg_name.insert(0, PH)
+                self.sg_name.configure(foreground="#8a8a8a")
+        self.sg_name.bind("<FocusIn>", name_in)
+        self.sg_name.bind("<FocusOut>", name_out)
+        self.sg_name.pack(anchor=tk.W, pady=(0, 6))
         self.sg_msg = tk.StringVar(value="")
         row = ttk.Frame(b)
         row.pack(anchor=tk.W)
