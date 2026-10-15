@@ -1308,7 +1308,7 @@ SETTING_DEFAULTS = {
     "theme": "Light", "theme_mode": "Default",
     # mapping
     "kw_f": "w", "kw_b": "s", "kw_l": "a", "kw_r": "d", "ka_f": "up", "ka_b": "down", "ka_l": "left", "ka_r": "right", "kb_jump": "space",
-    "win_use": False, "win_follow": False, "win_pos": "", "volume": 100.0, "vol_misc": 100.0, "vol_map": 100.0, "vol_uranium": 100.0,
+    "win_use": False, "win_follow": False, "win_pos": "", "ur_static": True, "ur_glitch": 100.0, "volume": 100.0, "vol_misc": 100.0, "vol_map": 100.0, "vol_uranium": 100.0,
 }
 for _k, _hz in (("kw_f", 440), ("kw_b", 330), ("kw_l", 262), ("kw_r", 392), ("ka_f", 440), ("ka_b", 330), ("ka_l", 262), ("ka_r", 392), ("kb_jump", 523), ("food", 659)):
     SETTING_DEFAULTS["hz_" + _k] = float(_hz)         # sine pulse pitch for that key
@@ -4250,21 +4250,33 @@ class FlyControllerApp:
         self._rs, self._rs_t = s_, now
         return s_
     def _static_fx(self, img):
-        """TV-static on the Control Panel's body camera when that camera is close to a uranium rod (stronger the closer it is)."""
+        """Uranium look on the Control Panel's body camera when that camera is close to a rod (stronger the closer it is):
+        grey snow (Settings > Display > TV static) plus glitching (slipping rows + flicker, scaled by Settings > Display > Glitch amount)."""
         k = self._rod_smooth() ** 1.2
-        if k < 0.004:
+        snow = bool(self.S("ur_static"))
+        try:
+            gl = max(0.0, min(5.0, float(self.S("ur_glitch")) / 100.0))
+        except Exception:
+            gl = 1.0
+        if k < 0.004 or (not snow and gl <= 0.0):
             return img
         rng = self._rng_fx = getattr(self, "_rng_fx", np.random.default_rng())
         h, w = img.shape[:2]
         out = img.astype(np.float32)
-        for _ in range(int(14 * k)):                                       # horizontal tearing: a few rows slip sideways (none at first)
+        for _ in range(min(120, int(14 * k * gl))):                                  # horizontal tearing: a few rows slip sideways (none at first)
             y0 = int(rng.integers(0, h))
             hh = int(rng.integers(1, 5))
-            out[y0:y0 + hh] = np.roll(out[y0:y0 + hh], int(rng.integers(-1, 2) * (4 + 28 * k)), axis=1)
-        noise = rng.integers(0, 256, (h, w, 1)).astype(np.float32)          # grey snow
-        a = 0.75 * k                                                        # no floor: the snow starts from nothing
-        out = out * (1.0 - a) + noise * a
-        out += (rng.random() - 0.5) * 40.0 * k                              # brightness flicker
+            out[y0:y0 + hh] = np.roll(out[y0:y0 + hh], int(rng.integers(-1, 2) * (4 + 28 * k) * (0.6 + 0.4 * gl)), axis=1)
+        if snow:
+            noise = rng.integers(0, 256, (h, w, 1)).astype(np.float32)      # grey snow
+            a = 0.75 * k                                                    # no floor: the snow starts from nothing
+            out = out * (1.0 - a) + noise * a
+        out += (rng.random() - 0.5) * 40.0 * k * gl                         # brightness flicker
+        if gl > 1.0:                                                        # above 100%: the colour channels drift apart too
+            sh = int((gl - 1.0) * k * 4.0 + rng.random())
+            if sh:
+                out[..., 0] = np.roll(out[..., 0], sh, axis=1)
+                out[..., 2] = np.roll(out[..., 2], -sh, axis=1)
         return np.clip(out, 0, 255).astype(np.uint8)
     def _tick_loop(self):
         """Far from a rod: single radiation ticks at random moments, more and more often (and louder) as the camera gets closer; near it the full loop takes over."""
@@ -4673,6 +4685,13 @@ class FlyControllerApp:
             ttk.Combobox(r, textvariable=self.sv[key], values=values, state="readonly", width=width).pack(side=tk.LEFT)
         def slide(f, text, key, lo, hi, fmt):
             self.make_slider(f, text, self.sv[key], lo, hi, fmt, label_w=26)
+        def reset_btn(f, name, keys, extra=None):
+            """A 'Reset <category>' button at the bottom of a category: puts only that category's settings back to their defaults."""
+            def go():
+                self.reset_settings(keys)
+                if extra:
+                    extra()
+            ttk.Button(f, text="Reset " + name + " to defaults", command=go).pack(anchor=tk.W, pady=(2, 0))
         # --- Performance
         f = page("Performance")
         b = box(f, "Speed")
@@ -4686,6 +4705,7 @@ class FlyControllerApp:
         check(b, "Neuron cloud", "draw_cloud")
         check(b, "Time graphs", "draw_graphs")
         check(b, "Smoke on the Build map", "draw_smoke")
+        reset_btn(f, "performance", ["fps", "body_hz", "only_open", "show_fps", "shadows", "draw_body", "draw_cloud", "draw_graphs", "draw_smoke"])
         # --- Body & physics
         f = page("Body & physics")
         b = box(f, "Motors and contact (applied live)")
@@ -4730,11 +4750,18 @@ class FlyControllerApp:
         ttk.Button(row, text="Randomize", command=self.randomize_layout).pack(side=tk.LEFT)
         self.layout_msg = tk.StringVar(value="")
         ttk.Label(b, textvariable=self.layout_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        reset_btn(f, "build tab", ["show_grid", "show_trail", "snap", "food_skin"])
         # --- Display
         f = page("Display")
         b = box(f, "Window")
         check(b, "Keep this window on top", "topmost")
         check(b, "Start on the Minimize page", "start_min")
+        b = box(f, "Uranium effects (on the Control Panel camera)")
+        check(b, "TV static (grey snow)", "ur_static")
+        slide(b, "Glitch amount (%)", "ur_glitch", 0, 500, "{:.0f}")
+        ttk.Label(b, text="Glitch = rows that slip sideways and the brightness flicker (above 100% the colours also split apart). 0 turns it off.", foreground="#555555",
+                  wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        reset_btn(f, "display", ["topmost", "start_min", "ur_static", "ur_glitch"])
         # --- Recording
         f = page("Recording")
         b = box(f, "Save")
@@ -4871,6 +4898,16 @@ class FlyControllerApp:
         ttk.Label(b, text="Select: drag a box around the fly. Start mapping (aligned): a right-angle corner marker sits on the pointer with thin red guide lines across the screen, to line up a pop-up\'s corner exactly. Blooket buttons are mapped for the game mode chosen on the Control Panel.", foreground="#555555",
                   wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         reg_text()
+        def map_extra():
+            reset_region()
+            self.set_food_key("")
+            try:
+                fbtn.configure(text="-")
+            except Exception:
+                pass
+            pos_text()
+        map_keys = [k for k in SETTING_DEFAULTS if k.startswith(("kw_", "ka_", "kb_", "hz_", "pl_", "win_", "vol"))]
+        reset_btn(f, "mapping", map_keys, map_extra)
         # --- Profiles
         f = page("Profiles")
         b = box(f, "Presets")
@@ -4881,6 +4918,7 @@ class FlyControllerApp:
         self.red_button(row, "Reset ALL settings", lambda: self.reset_settings()).pack(side=tk.LEFT)
         ttk.Label(b, text="Settings are saved automatically to flylab_settings.json and loaded next time.", foreground="#555555",
                   wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        reset_btn(f, "profile", ["profile"])
         # --- Theme
         f = page("Theme")
         b = box(f, "Appearance")
@@ -4894,6 +4932,7 @@ class FlyControllerApp:
         ttk.Radiobutton(b, text="Default", variable=self.sv["theme_mode"], value="Default").pack(anchor=tk.W, pady=1)
         ttk.Label(b, text="Default = the theme chosen above. Randomize = Light or Dark at random each start.", foreground="#555555",
                   wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        reset_btn(f, "theme", ["theme", "theme_mode"])
         # --- Advanced
         f = page("Advanced")
         b = box(f, "Debug")
@@ -4901,6 +4940,7 @@ class FlyControllerApp:
         ttk.Button(b, text="Copy diagnostic report", command=self.copy_report).pack(anchor=tk.W, pady=(4, 0))
         self.adv_msg = tk.StringVar(value="")
         ttk.Label(b, textvariable=self.adv_msg, foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        reset_btn(f, "advanced", ["print_timings"])
         # --- Suggestions
         f = page("Suggestions")
         b = box(f, "Tell me what to add or fix")
