@@ -390,6 +390,22 @@ class Arena:
                 continue
             keep.append(p)
         self.rad = keep
+    def smoke_foods(self):
+        """The food that gives off smoke: everything except uranium rods (their smell is the radiation particles instead)."""
+        return [f for f in self.foods if self.skin_of(f[0], f[1]) != "Uranium rods"]
+    def rad_conc(self, pts):
+        """Smell of the radiation particles at each point (N, 2): (concentration (N,), direction the particles are flying there in rad or None)."""
+        pts = np.asarray(pts, float)
+        if not self.rad:
+            return np.zeros(len(pts)), None
+        r = np.asarray(self.rad, float)
+        d2 = ((pts[:, None, :] - r[None, :, :2]) ** 2).sum(-1)
+        wgt = 0.7 * np.exp(-d2 / (2.0 * 1.6 ** 2))                      # each particle is a small blob of 'odour'
+        c = wgt.sum(1)
+        tot = wgt.sum()
+        if tot < 1e-6:
+            return c, None
+        return c, math.atan2(float((wgt.sum(0) * r[:, 3]).sum()), float((wgt.sum(0) * r[:, 2]).sum()))
     def add_food(self, x, y):
         self.food_skins[(round(float(x), 2), round(float(y), 2))] = self.skin          # this food keeps the skin picked now
         self.foods.append([float(x), float(y), 1.0])
@@ -2881,14 +2897,22 @@ class FlyControllerApp:
             wspd = float(self.wind_speed_var.get())
             if self.S("wind_mode") == "Gusting":
                 wspd *= max(0.0, 1.0 + 0.6 * math.sin(now * 0.7) * math.sin(now * 0.23 + 1.0))
-            self.arena.plume.update(dt, self.arena.foods, wspd, float(self.wind_dir_var.get()), turb=float(self.S("turb")),
+            self.arena.plume.update(dt, self.arena.smoke_foods(), wspd, float(self.wind_dir_var.get()), turb=float(self.S("turb")),
                                     obstacles=self.arena.obstacles if self.S("smoke_obst") else ())
         self.arena.rad_update(dt)
         if self.sim.running and dynamic:
             feeding = self.arena.feed(self.body.x, self.body.y, dt)
         cl = cr = 0.0                                      # odour at the two antennae (plume + any test pulse from the Miscellaneous page)
         if plume_on:
-            cl, cr = (float(v) for v in self.arena.plume.conc(self.arena.antennae(self.body.x, self.body.y, self.body.heading)))
+            ant = self.arena.antennae(self.body.x, self.body.y, self.body.heading)
+            cl, cr = (float(v) for v in self.arena.plume.conc(ant))
+        wdir = self.arena.plume.wind_dir
+        rc, rdir = self.arena.rad_conc(self.arena.antennae(self.body.x, self.body.y, self.body.heading))          # uranium: the radiation particles are the odour
+        if rdir is not None and float(rc.sum()) > 0.0:
+            if float(rc.sum()) > cl + cr:
+                wdir = rdir                                    # steer against the way the particles fly = towards the rod
+            cl += float(rc[0])
+            cr += float(rc[1])
         t_now = time.perf_counter()
         if self.odor_pulse["l"] > t_now:
             cl += ODOR_PULSE
@@ -2902,7 +2926,7 @@ class FlyControllerApp:
                 sense = self.arena.sense(self.body.x, self.body.y, self.body.heading)
                 if plume_on or cl > 0.0 or cr > 0.0:       # smell = the plume (or a test pulse): antennae sample the odour, the tracker steers
                     near = self.arena.near_food(self.body.x, self.body.y, self.body.heading)
-                    sense["food"] = self.tracker.update(dt, float(cl), float(cr), self.arena.plume.wind_dir, self.body.heading, near)
+                    sense["food"] = self.tracker.update(dt, float(cl), float(cr), wdir, self.body.heading, near)
                 lvl, bk, lt, rt = env_commands(sense, self.explorer.update(dt))
                 # stuck-escape: if the fly has hardly moved for a few seconds (pinned at a wall / obstacle), turn away and walk off
                 self._stuck_clock = getattr(self, "_stuck_clock", 0.0) + dt
