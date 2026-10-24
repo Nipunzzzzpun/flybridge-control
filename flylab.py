@@ -1285,6 +1285,10 @@ DOWNLOAD_CMD = ("gsutil cp gs://flyem-male-cns/v1.0/connectome-data/flat-connect
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_settings.json")
 LAYOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_layout.json")
 SUGGEST_EMAIL = ""      # put your e-mail address here: the "Email it" button in Settings > Suggestions opens a message to it
+# Urgency dropdown -> (server emoji name, its Discord ID, fallback emoji used until the ID is filled in).
+# Get an ID by typing  \:Okay:  in Discord and sending it: it shows <:Okay:123456789012345678>, paste just the number below.
+SUGGEST_URGENCY_EMOJI = {"Low": ("Okay", "", "\U0001F7E2"), "Moderate": ("Moderate", "", "\U0001F7E0"), "Urgent": ("Urgent", "", "\U0001F534")}
+SUGGEST_URGENCY = {k: ("<:%s:%s>" % (v[0], v[1]) if v[1].strip() else v[2]) for k, v in SUGGEST_URGENCY_EMOJI.items()}
 SUGGEST_STATUS = "Available"    # shown under Suggestions: "Available" (green), "Busy" (amber) or "Away" (red)
 DISCORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_discord.json")   # {"token": "<bot token>", "user_id": 123456789012345678}
 CONFETTI_SOUND = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "yipeeeeeeeee.mp3"),
@@ -4111,6 +4115,10 @@ class FlyControllerApp:
                 st["note"] = "Discord: you are not in a server with the bot"
             @client.event
             async def on_ready():
+                try:
+                    st["emojis"] = {e.name.lower(): str(e) for e in client.emojis}     # the server's custom emoji (:Okay: etc.) as <:Okay:ID>, so no IDs need typing
+                except Exception:
+                    pass
                 look()
             @client.event
             async def on_presence_update(before, after):
@@ -4190,7 +4198,12 @@ class FlyControllerApp:
         self.sg_msg.set("Sending...")
         who = self._sg_who()
         ttl = self._sg_title()
-        msg = (("# " + ttl + "\n\n") if ttl else "") + t + (("\n-# Suggested by " + who) if who else "")
+        urg = self.sg_urg.get()
+        if urg not in SUGGEST_URGENCY:
+            self.sg_msg.set("Select an urgency first.")
+            return
+        emo = self._dc_state.get("emojis", {}).get(SUGGEST_URGENCY_EMOJI[urg][0].lower()) or SUGGEST_URGENCY[urg]   # server emoji if the bot found it, else the ID/fallback
+        msg = (("# " + ttl + "\n\n") if ttl else "") + t + "\n-# " + emo + ((" Suggested by __" + who + "__") if who else "")
         st = self._dc_state
         def send():
             import urllib.request
@@ -4982,8 +4995,8 @@ class FlyControllerApp:
         f = page("Suggestions")
         b = box(f, "Tell me what to add or fix")
         ttk.Label(b, text="Send suggestions or bug reports", foreground="#555555").pack(anchor=tk.W)
-        def ph_entry(width, text):
-            e = ttk.Entry(b, width=width)
+        def ph_entry(width, text, parent=None):
+            e = ttk.Entry(parent or b, width=width)
             e.insert(0, text)
             e.configure(foreground="#8a8a8a")
             def fin(_e=None):
@@ -5003,8 +5016,12 @@ class FlyControllerApp:
         self.sg_text = tk.Text(b, width=62, height=6, wrap="word", font=("Segoe UI", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbbbbb")
         self.sg_text.pack(anchor=tk.W, pady=(4, 4))
         self._sg_ph = "Enter your name here"
-        self.sg_name = ph_entry(30, self._sg_ph)
-        self.sg_name.pack(anchor=tk.W, pady=(0, 6))
+        nrow = ttk.Frame(b)
+        nrow.pack(anchor=tk.W, pady=(0, 6))
+        self.sg_name = ph_entry(30, self._sg_ph, nrow)
+        self.sg_name.pack(side=tk.LEFT)
+        self.sg_urg = tk.StringVar(value="Select Urgency")                   # urgency of the suggestion, posted first in the Discord message
+        ttk.Combobox(nrow, textvariable=self.sg_urg, values=list(SUGGEST_URGENCY), state="readonly", width=15).pack(side=tk.LEFT, padx=(6, 0))
         self.sg_msg = tk.StringVar(value="")
         row = ttk.Frame(b)
         row.pack(anchor=tk.W)
@@ -5019,6 +5036,10 @@ class FlyControllerApp:
         self._led.create_oval(4, 3, 8, 7, fill="#ffffff", outline="", stipple="gray50")       # little highlight
         self._led_txt = tk.StringVar(value=SUGGEST_STATUS)
         ttk.Label(srow, textvariable=self._led_txt).pack(side=tk.LEFT)
+        scv = tk.Canvas(b, width=300, height=22, bg=bg, highlightthickness=0, bd=0)       # inset note, same style as "More themes coming..."
+        scv.pack(anchor=tk.W, pady=(2, 0))
+        scv.create_text(2, 12, text="Status of Nipun, not the bot.", anchor="w", font=(pix, 9), fill="#ffffff")
+        scv.create_text(1, 11, text="Status of Nipun, not the bot.", anchor="w", font=(pix, 9), fill="#7a7a7a")
         self._dc_state = {"status": None, "note": ""}              # written by the Discord thread, read here (plain strings only)
         self._start_discord()
         self._poll_status()
