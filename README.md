@@ -105,8 +105,8 @@ You can delete the raw connectome files after `brain_subset.npz` is built (about
 ## Install (Windows)
 Requires **Python 3.12 or newer** and **Git**.
 ```powershell
-git clone https://github.com/<you>/FlyLab.git
-cd FlyLab
+git clone https://github.com/Nipunzzzzpun/flybridge-control.git
+cd flybridge-control
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 That creates a venv, installs everything and adds a desktop shortcut. Or by hand:
@@ -116,12 +116,14 @@ py -3.12 -m venv venv
 pip install -r requirements.txt
 python flylab.py
 ```
+Optional: the green/amber/red status light in Settings > Suggestions only works in the maintainer's copy and needs `pip install discord.py` plus a private `flylab_discord.json` (never commit it).
+
 FlyGym 2.x is installed from GitHub (`flygym @ git+https://github.com/NeLy-EPFL/flygym.git@v2.1.0`); an old PyPI FlyGym 1.x will not work.
 
 ## Updating
 If you cloned the repo, pull the latest version and refresh the dependencies:
 ```powershell
-cd FlyLab
+cd flybridge-control
 git pull
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt --upgrade
