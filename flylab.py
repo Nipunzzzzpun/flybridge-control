@@ -1285,7 +1285,7 @@ DOWNLOAD_CMD = ("gsutil cp gs://flyem-male-cns/v1.0/connectome-data/flat-connect
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_settings.json")
 LAYOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_layout.json")
 SUGGEST_EMAIL = ""      # put your e-mail address here: the "Email it" button in Settings > Suggestions opens a message to it
-SUGGEST_RELAY = ""     # your relay URL (see relay/README.md). With it set, every user can send suggestions and the real Discord webhook never leaves the relay
+SUGGEST_RELAY = "https://flylab-relay.81150.workers.dev"     # your relay URL (see relay/README.md). With it set, every user can send suggestions and the real Discord webhook never leaves the relay
 # Urgency dropdown -> (server emoji name, its Discord ID, fallback emoji used until the ID is filled in).
 # Get an ID by typing  \:Okay:  in Discord and sending it: it shows <:Okay:123456789012345678>, paste just the number below.
 SUGGEST_URGENCY_EMOJI = {"Low": ("Okay", "", "\U0001F7E2"), "Moderate": ("Moderate", "", "\U0001F7E0"), "Urgent": ("Urgent", "", "\U0001F534")}
