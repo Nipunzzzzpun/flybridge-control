@@ -4229,7 +4229,12 @@ class FlyControllerApp:
                 urllib.request.urlopen(req, timeout=10, context=ctx).read()
                 st["sent"] = "OK"
             except urllib.error.HTTPError as err:
-                st["sent"] = "Too many suggestions, try again in a minute." if err.code == 429 else "Send failed (%s)" % err.code
+                if err.code == 429:
+                    st["sent"] = "Too many suggestions, try again in a minute."
+                elif err.code == 404:
+                    st["sent"] = "Send failed (404): the %s address was not found (deleted or changed?)" % ("relay" if relay else "webhook")
+                else:
+                    st["sent"] = "Send failed (%s) via the %s" % (err.code, "relay" if relay else "webhook")
             except Exception as err:
                 st["sent"] = "Discord send failed: %s" % err
         threading.Thread(target=send, daemon=True).start()
