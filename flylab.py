@@ -1288,7 +1288,7 @@ SUGGEST_EMAIL = ""      # put your e-mail address here: the "Email it" button in
 SUGGEST_RELAY = "https://flylab-relay.81150.workers.dev"     # your relay URL (see relay/README.md). With it set, every user can send suggestions and the real Discord webhook never leaves the relay
 # Urgency dropdown -> (server emoji name, its Discord ID, fallback emoji used until the ID is filled in).
 # Get an ID by typing  \:Okay:  in Discord and sending it: it shows <:Okay:123456789012345678>, paste just the number below.
-SUGGEST_URGENCY_EMOJI = {"Low": ("okay", "", "\U0001F7E2"), "Moderate": ("moderate", "", "\U0001F7E0"), "Urgent": ("urgent", "", "\U0001F534")}
+SUGGEST_URGENCY_EMOJI = {"Low": ("Okay", "1563371780557639812", "\U0001F7E2"), "Moderate": ("Moderate", "1563371748102119505", "\U0001F7E0"), "Urgent": ("Urgent", "1563371712433881108", "\U0001F534")}
 SUGGEST_URGENCY = {k: ("<:%s:%s>" % (v[0], v[1]) if v[1].strip() else v[2]) for k, v in SUGGEST_URGENCY_EMOJI.items()}
 SUGGEST_STATUS = "Available"    # shown under Suggestions: "Available" (green), "Busy" (amber) or "Away" (red)
 DISCORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flylab_discord.json")   # {"token": "<bot token>", "user_id": 123456789012345678}
