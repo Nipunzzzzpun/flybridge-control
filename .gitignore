@@ -9,3 +9,6 @@ flylab_blooket_map.json
 # connectome data is NOT redistributed here
 data/
 *.feather
+
+# personal settings and secrets (Discord webhook / bot token live here: NEVER commit)
+flylab_*.json

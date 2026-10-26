@@ -1,0 +1,8 @@
+name = "flylab-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# create it once with:  npx wrangler kv namespace create RL   and paste the id below
+[[kv_namespaces]]
+binding = "RL"
+id = "PASTE_KV_NAMESPACE_ID_HERE"
