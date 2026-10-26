@@ -8,3 +8,4 @@ pyarrow
 pandas
 neuprint-python
 flygym @ git+https://github.com/NeLy-EPFL/flygym.git@v2.1.0
+certifi

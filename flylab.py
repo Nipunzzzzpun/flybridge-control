@@ -4221,7 +4221,12 @@ class FlyControllerApp:
                     body = json.dumps({"content": msg[:1990], "allowed_mentions": {"parse": []}}).encode("utf-8")
                     url = hook
                 req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "FlyLab/1.0"})
-                urllib.request.urlopen(req, timeout=10).read()
+                try:                 # use certifi's up-to-date certificate list (Windows' own list can be out of date: "certificate has expired")
+                    import ssl, certifi
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                except Exception:
+                    ctx = None
+                urllib.request.urlopen(req, timeout=10, context=ctx).read()
                 st["sent"] = "OK"
             except urllib.error.HTTPError as err:
                 st["sent"] = "Too many suggestions, try again in a minute." if err.code == 429 else "Send failed (%s)" % err.code
